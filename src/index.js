@@ -33,6 +33,7 @@
 
 require("dotenv").config();
 
+const path = require("path");
 const http = require("http");
 const express = require("express");
 const cors = require("cors");
@@ -54,6 +55,12 @@ app.use(express.json());
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
+});
+
+// ── Dashboard ────────────────────────────────────────────────────────
+
+app.get("/dashboard", (_req, res) => {
+  res.sendFile(path.join(__dirname, "..", "dashboard.html"));
 });
 
 // ── Routes ──────────────────────────────────────────────────────────
