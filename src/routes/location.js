@@ -1,11 +1,18 @@
-
 const { Router } = require("express");
 const { redis } = require("../redis");
 const { pool } = require("../db");
 const { processLocation, getUserState, clearUserState, haversineDistance } = require("../gps");
 const { rateLimitPing } = require("../rateLimit");
 const router = Router();
-const LOCATION_TTL = 60;
+
+// FIX: TTL raised from 60s → 300s (5 min)
+// With 1s pings this is fine, but gives a buffer for background/offline gaps
+const LOCATION_TTL = 300;
+
+// FIX: Session key TTL — prevents Redis memory filling up with unbounded log lists
+// With 1s pings you generate ~3600 entries/hour. Without TTL, long sessions OOM Redis.
+const SESSION_TTL = 86400; // 24 hours
+
 const TRAIL_MIN_DISTANCE = 5; // meters — minimum distance between trail dots
 
 const CHANNEL = "location_updates";
@@ -34,9 +41,10 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
     const userAccuracy = typeof accuracy === "number" ? accuracy : null;
     const userTimestamp = typeof timestamp === "number" ? timestamp : null;
 
-    // ── GPS filtering (Comprehensive GPS fixes applied) ──────
+    // ── GPS filtering ──────────────────────────────────────────────
     const state = getUserState(userId);
-    const processed = processLocation(lat, lng, userSpeed, state.prev, state.kalman, userAccuracy, userTimestamp, userId);
+    // FIX: pass state as last argument so gps.js uses per-user smoothing
+    const processed = processLocation(lat, lng, userSpeed, state.prev, state.kalman, userAccuracy, userTimestamp, userId, state);
 
     if (!processed) {
       // Rejected as noise/spike — don't store or broadcast
@@ -90,12 +98,18 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       redis.publish(CHANNEL, JSON.stringify(payload)),
       redis.set(sessionStartKey, now, { NX: true }),
       redis.rPush(sessionLogsKey, locationPoint),
+      // FIX: Set TTL on session keys to prevent unbounded Redis memory growth.
+      // 1s pings = ~3600 entries/hour. Without TTL, long sessions fill Redis → 500 errors.
+      redis.expire(sessionLogsKey, SESSION_TTL),
+      redis.expire(trailKey, SESSION_TTL),
+      redis.expire(sessionStartKey, SESSION_TTL),
     ];
 
     // Store start marker on first ping
     if (isFirstPing) {
       const startMarker = JSON.stringify({ lat: processed.latitude, lng: processed.longitude, timestamp: now });
       redisOps.push(redis.set(startMarkerKey, startMarker));
+      redisOps.push(redis.expire(startMarkerKey, SESSION_TTL));
     }
 
     // Store trail dot
@@ -208,7 +222,6 @@ router.post("/:id/stop", async (req, res) => {
 });
 
 // ── GET /users/active ────────────────────────────────────────────────
-// Paginated with cursor-based Redis SSCAN. Default limit=50.
 
 router.get("/users/active", async (req, res) => {
   try {
@@ -239,7 +252,6 @@ router.get("/users/active", async (req, res) => {
       redis.sRem(ACTIVE_SET, staleIds).catch(() => {});
     }
 
-    // Also return total count (SCARD is O(1))
     const total = await redis.sCard(ACTIVE_SET);
 
     return res.status(200).json({
@@ -256,7 +268,6 @@ router.get("/users/active", async (req, res) => {
 });
 
 // ── GET /sessions/all ────────────────────────────────────────────────
-// Paginated. Default page=1, limit=20.
 
 router.get("/sessions/all", async (req, res) => {
   try {
@@ -309,7 +320,6 @@ router.get("/user/:id", async (req, res) => {
 });
 
 // ── GET /user/:id/trail ──────────────────────────────────────────────
-// Returns trail dots + start marker for an active user.
 
 router.get("/user/:id/trail", async (req, res) => {
   try {
@@ -331,7 +341,6 @@ router.get("/user/:id/trail", async (req, res) => {
 });
 
 // ── GET /user/:id/sessions ──────────────────────────────────────────
-// Paginated. Default page=1, limit=20.
 
 router.get("/user/:id/sessions", async (req, res) => {
   try {
@@ -366,7 +375,6 @@ router.get("/user/:id/sessions", async (req, res) => {
 });
 
 // ── GET /session/:sessionId/logs ────────────────────────────────────
-// Paginated. Default page=1, limit=500.
 
 router.get("/session/:sessionId/logs", async (req, res) => {
   try {
