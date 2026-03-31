@@ -11,7 +11,7 @@
  * Set PING_INTERVAL_MS in your .env to tune this. Always keep it slightly
  * below your frontend timeInterval (e.g. frontend=1000ms → limit=800ms).
  */
-const { redis } = require("./redis");
+const { redis } = require("../redis");
 
 // FIX: was 5000ms — blocked all pings sent faster than 5s
 // Now 800ms — allows 1s frontend pings through with a small buffer

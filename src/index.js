@@ -33,7 +33,6 @@
 
 require("dotenv").config();
 
-const path = require("path");
 const http = require("http");
 const express = require("express");
 const cors = require("cors");
@@ -41,7 +40,7 @@ const cors = require("cors");
 const { connectRedis } = require("./redis");
 const { connectDB } = require("./db");
 const { initSocket } = require("./socket");
-const locationRoutes = require("./routes/location");
+const routes = require("./routes");
 
 const app = express();
 const PORT = process.env.PORT || 9001;
@@ -62,15 +61,9 @@ app.get("/health", (_req, res) => {
   });
 });
 
-// ── Dashboard ────────────────────────────────────────────────────────
-
-app.get("/dashboard", (_req, res) => {
-  res.sendFile(path.join(__dirname, "..", "dashboard.html"));
-});
-
 // ── Routes ──────────────────────────────────────────────────────────
 
-app.use("/", locationRoutes);
+app.use("/", routes);
 
 // ── Server bootstrap ────────────────────────────────────────────────
 // We create a raw http.Server so both Express and Socket.io share
