@@ -156,11 +156,26 @@ router.post("/:id/stop", async (req, res) => {
     const durationSecs = Math.floor((now - sessionStart) / 1000);
     const parsedLogs = logs.map((l) => JSON.parse(l));
 
+    // FIX: Compute avg/max speed from filtered speed values stored in Redis logs.
+    // Previously these were never calculated — sessions table had no speed columns.
+    // Only include moving points (speed > 0.5 m/s) so stationary time doesn't
+    // drag avg speed down to near-zero, matching frontend behavior.
+    const movingPoints = parsedLogs.filter(p => typeof p.speed === 'number' && p.speed > 0.5);
+    const maxSpeed = movingPoints.length > 0
+      ? Math.max(...movingPoints.map(p => p.speed))
+      : 0;
+    const avgSpeed = movingPoints.length > 0
+      ? movingPoints.reduce((sum, p) => sum + p.speed, 0) / movingPoints.length
+      : 0;
+    // Convert m/s → km/h, round to 2 decimal places
+    const maxSpeedKmh = Math.round(maxSpeed * 3.6 * 100) / 100;
+    const avgSpeedKmh = Math.round(avgSpeed * 3.6 * 100) / 100;
+
     const sessionResult = await pool.query(
-      `INSERT INTO sessions (user_id, session_name, started_at, ended_at, duration_secs, total_pings)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO sessions (user_id, session_name, started_at, ended_at, duration_secs, total_pings, avg_speed_kmh, max_speed_kmh)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING id`,
-      [userId, sessionName, sessionStart, now, durationSecs, parsedLogs.length]
+      [userId, sessionName, sessionStart, now, durationSecs, parsedLogs.length, avgSpeedKmh, maxSpeedKmh]
     );
     const sessionId = sessionResult.rows[0].id;
 
@@ -210,6 +225,8 @@ router.post("/:id/stop", async (req, res) => {
         id: sessionId, name: sessionName, userId,
         startedAt: sessionStart, endedAt: now,
         durationSecs, totalPings: parsedLogs.length,
+        avgSpeedKmh,
+        maxSpeedKmh,
         startMarker,
         stopMarker,
         trail: parsedTrail,
@@ -228,7 +245,11 @@ router.get("/users/active", async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
     const cursor = req.query.cursor || "0";
 
-    const [nextCursor, userIds] = await redis.sScan(ACTIVE_SET, cursor, { COUNT: limit });
+    // FIX: node-redis v4 sScan returns { cursor, members } object, NOT an array.
+    // Destructuring as array throws "is not iterable". Use object destructuring instead.
+    const scanResult = await redis.sScan(ACTIVE_SET, cursor, { COUNT: limit });
+    const nextCursor = scanResult.cursor;
+    const userIds = scanResult.members;
 
     if (userIds.length === 0) {
       return res.status(200).json({ ok: true, data: [], cursor: "0", hasMore: false });
@@ -259,7 +280,7 @@ router.get("/users/active", async (req, res) => {
       data: users,
       total,
       cursor: nextCursor,
-      hasMore: nextCursor !== "0",
+      hasMore: String(nextCursor) !== "0",
     });
   } catch (err) {
     console.error("[GET /users/active] Error:", err.message);
@@ -278,7 +299,7 @@ router.get("/sessions/all", async (req, res) => {
     const [countResult, result] = await Promise.all([
       pool.query("SELECT COUNT(*) AS total FROM sessions"),
       pool.query(
-        `SELECT id, user_id, session_name, started_at, ended_at, duration_secs, total_pings, created_at
+        `SELECT id, user_id, session_name, started_at, ended_at, duration_secs, total_pings, avg_speed_kmh, max_speed_kmh, created_at
          FROM sessions ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
         [limit, offset]
       ),
@@ -352,7 +373,7 @@ router.get("/user/:id/sessions", async (req, res) => {
     const [countResult, result] = await Promise.all([
       pool.query("SELECT COUNT(*) AS total FROM sessions WHERE user_id = $1", [id]),
       pool.query(
-        `SELECT id, session_name, started_at, ended_at, duration_secs, total_pings, created_at
+        `SELECT id, session_name, started_at, ended_at, duration_secs, total_pings, avg_speed_kmh, max_speed_kmh, created_at
          FROM sessions WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
         [id, limit, offset]
       ),

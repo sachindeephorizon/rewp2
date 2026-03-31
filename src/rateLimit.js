@@ -15,7 +15,7 @@ const { redis } = require("./redis");
 
 // FIX: was 5000ms — blocked all pings sent faster than 5s
 // Now 800ms — allows 1s frontend pings through with a small buffer
-const MIN_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS) || 800;
+const MIN_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS) || 4500;
 
 async function rateLimitPing(req, res, next) {
   const userId = req.params.id;
