@@ -53,6 +53,14 @@ async function connectDB() {
     console.log("[Postgres] Connected");
 
     await client.query(`
+      CREATE TABLE IF NOT EXISTS app_users (
+        id            SERIAL PRIMARY KEY,
+        name          VARCHAR(100) NOT NULL,
+        email         VARCHAR(255) UNIQUE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        created_at    TIMESTAMPTZ DEFAULT NOW()
+      );
+
       CREATE TABLE IF NOT EXISTS sessions (
         id            SERIAL PRIMARY KEY,
         user_id       VARCHAR(100) NOT NULL,

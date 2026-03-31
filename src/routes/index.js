@@ -1,10 +1,14 @@
 const { Router } = require("express");
 
+const authRoutes = require("./auth");
 const trackingRoutes = require("./tracking");
 const usersRoutes = require("./users");
 const sessionsRoutes = require("./sessions");
 
 const router = Router();
+
+// POST /auth/register, POST /auth/login, GET /auth/me
+router.use("/auth", authRoutes);
 
 // POST /:id/ping, POST /:id/stop
 router.use("/", trackingRoutes);
