@@ -79,14 +79,13 @@ async function start() {
   server.listen(PORT, () => {
     console.log("═══════════════════════════════════════════════════");
     console.log(`  Worker ${process.pid} | Port ${PORT}`);
-    console.log("  Endpoints:");
-    console.log("    POST /:id/ping       → update user location");
-    console.log("    GET  /user/:id       → fetch latest location");
-    console.log("    GET  /users/active   → list active users");
-    console.log("    GET  /health         → health check");
-    console.log("    WS   /              → Socket.io (locationUpdate)");
     console.log("  Scaling: Redis adapter ✓ | Rate limiter ✓");
     console.log("═══════════════════════════════════════════════════");
+
+    // Self-ping every 13 minutes to prevent Render free tier from sleeping
+    setInterval(() => {
+      fetch(`http://localhost:${PORT}/health`).catch(() => {});
+    }, 13 * 60 * 1000);
   });
 
   // ── Graceful shutdown ───────────────────────────────────────────

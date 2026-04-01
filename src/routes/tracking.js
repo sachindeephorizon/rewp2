@@ -38,7 +38,6 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       return res.status(200).json({ ok: true, filtered: true, reason: "GPS spike rejected" });
     }
 
-    const isFirstPing = !state.prev;
     state.prev = processed;
 
     const now = new Date().toISOString();
@@ -47,6 +46,11 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
     const sessionLogsKey = `session:${userId}:logs`;
     const trailKey = `trail:${userId}`;
     const startMarkerKey = `marker:${userId}:start`;
+
+    // Check if this user already has an active session in Redis
+    // (survives server restarts — in-memory GPS state doesn't)
+    const existingSession = await redis.get(sessionStartKey);
+    const isFirstPing = !existingSession;
 
     // Trail dot — only add if moved enough since last dot
     let addTrailDot = false;
@@ -80,7 +84,54 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
     ];
 
     if (isFirstPing) {
-      // Clear stale data from previous session, set fresh start time
+      // If there's leftover session data from a previous session that was
+      // never stopped (e.g. server restarted, app crashed), save it to DB
+      // before clearing so it's not lost.
+      try {
+        const [oldStart, oldLogs] = await Promise.all([
+          redis.get(sessionStartKey),
+          redis.lRange(sessionLogsKey, 0, -1),
+        ]);
+        if (oldStart && oldLogs && oldLogs.length > 0) {
+          const parsedOldLogs = oldLogs.map((l) => JSON.parse(l));
+          const oldSessionStart = new Date(oldStart);
+          const oldNow = new Date();
+          const oldDuration = Math.floor((oldNow - oldSessionStart) / 1000);
+          const countRes = await pool.query("SELECT COUNT(*) AS cnt FROM sessions WHERE user_id = $1", [userId]);
+          const num = parseInt(countRes.rows[0].cnt, 10) + 1;
+          const oldName = `session${num}`;
+
+          const firstOld = parsedOldLogs[0];
+          const lastOld = parsedOldLogs[parsedOldLogs.length - 1];
+          const [startLoc, endLoc] = await Promise.all([
+            firstOld ? reverseGeocode(firstOld.lat, firstOld.lng) : null,
+            lastOld ? reverseGeocode(lastOld.lat, lastOld.lng) : null,
+          ]);
+
+          const sResult = await pool.query(
+            `INSERT INTO sessions (user_id, session_name, started_at, ended_at, duration_secs, total_pings, start_location, end_location)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+            [userId, oldName, oldSessionStart, oldNow, oldDuration, parsedOldLogs.length, startLoc, endLoc]
+          );
+          const oldSid = sResult.rows[0].id;
+          const BATCH = 500;
+          for (let b = 0; b < parsedOldLogs.length; b += BATCH) {
+            const batch = parsedOldLogs.slice(b, b + BATCH);
+            const vals = [], params = [];
+            batch.forEach((p, i) => {
+              const o = i * 4;
+              vals.push(`($${o+1},$${o+2},$${o+3},$${o+4})`);
+              params.push(oldSid, p.lat, p.lng, p.timestamp);
+            });
+            await pool.query(`INSERT INTO location_logs (session_id, lat, lng, recorded_at) VALUES ${vals.join(",")}`, params);
+          }
+          console.log(`[ping] Auto-saved orphan session: ${oldName} | ${parsedOldLogs.length} pts`);
+        }
+      } catch (e) {
+        console.error("[ping] Failed to save orphan session:", e.message);
+      }
+
+      // Now clear and start fresh
       redisOps.push(redis.del(sessionLogsKey));
       redisOps.push(redis.del(trailKey));
       redisOps.push(redis.set(sessionStartKey, now));
