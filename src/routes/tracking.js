@@ -4,6 +4,7 @@ const { pool } = require("../db");
 const { processLocation, getUserState, clearUserState, haversineDistance } = require("../utils/gps");
 const { reverseGeocode } = require("../utils/geocode");
 const { rateLimitPing } = require("../utils/rateLimit");
+const { snapToRoad, snapTrajectory } = require("../utils/snapToRoad");
 const { LOCATION_TTL, SESSION_TTL, TRAIL_MIN_DISTANCE, CHANNEL, ACTIVE_SET } = require("../config");
 
 const router = Router();
@@ -46,6 +47,13 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
 
     state.prev = processed;
 
+    // Road snap — snap processed coordinates to nearest road (non-blocking)
+    const snapped = isRealMovement
+      ? await snapToRoad(processed.latitude, processed.longitude)
+      : { lat: processed.latitude, lng: processed.longitude, snapped: false };
+    const finalLat = snapped.lat;
+    const finalLng = snapped.lng;
+
     const now = new Date().toISOString();
     const redisKey = `user:${userId}`;
     const sessionStartKey = `session:${userId}:start`;
@@ -65,21 +73,21 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       addTrailDot = true;
     } else {
       const lastDot = JSON.parse(lastDotRaw);
-      if (haversineDistance(lastDot.lat, lastDot.lng, processed.latitude, processed.longitude) >= TRAIL_MIN_DISTANCE) {
+      if (haversineDistance(lastDot.lat, lastDot.lng, finalLat, finalLng) >= TRAIL_MIN_DISTANCE) {
         addTrailDot = true;
       }
     }
 
     const payload = {
       userId,
-      lat: processed.latitude,
-      lng: processed.longitude,
+      lat: finalLat,
+      lng: finalLng,
       timestamp: now,
     };
 
     const locationPoint = JSON.stringify({
-      lat: processed.latitude,
-      lng: processed.longitude,
+      lat: finalLat,
+      lng: finalLng,
       timestamp: now,
     });
 
@@ -242,7 +250,12 @@ router.post("/:id/stop", async (req, res) => {
     const finalLog = parsedLogs[parsedLogs.length - 1];
     const stopMarker = finalLog ? { lat: finalLog.lat, lng: finalLog.lng } : null;
     const startMarker = startMarkerRaw ? JSON.parse(startMarkerRaw) : null;
-    const parsedTrail = trailDots.map((d) => JSON.parse(d));
+    const rawTrail = trailDots.map((d) => JSON.parse(d));
+
+    // Snap entire trail to roads for smooth playback
+    const parsedTrail = rawTrail.length >= 2
+      ? await snapTrajectory(rawTrail)
+      : rawTrail;
 
     await Promise.all([
       redis.del(`user:${userId}`),

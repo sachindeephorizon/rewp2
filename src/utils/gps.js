@@ -10,7 +10,7 @@ const MAX_SPEED_MS = 50;          // ~180 km/h — reject anything faster
 const STATIONARY_THRESHOLD = 5;   // meters — ignore drift below this
 const MAX_JUMP_DIST = 100;        // meters — reject teleports
 const MAX_DT = 5;                 // seconds — clamp time gap
-const ACCURACY_THRESHOLD = 30;    // meters — reject GPS >30m accuracy
+const ACCURACY_THRESHOLD = 20;    // meters — reject GPS >20m accuracy
 
 // ── 2D Kalman Filter ────────────────────────────────────────────────
 class KalmanFilter2D {
@@ -123,8 +123,11 @@ function processLocation(newLat, newLng, prevEntry, kalman, accuracy = null, tim
   const teleportSpeed = rawDist / dt;
   if (teleportSpeed > MAX_SPEED_MS) return null;
 
-  // Check raw distance for stationary detection before Kalman
-  const isStationary = rawDist < STATIONARY_THRESHOLD;
+  // Scale stationary threshold by accuracy — worse GPS = higher bar
+  const dynamicThreshold = accuracy !== null
+    ? Math.max(STATIONARY_THRESHOLD, accuracy * 0.8)
+    : STATIONARY_THRESHOLD;
+  const isStationary = rawDist < dynamicThreshold;
 
   if (isStationary) {
     kalman.update([prevEntry.latitude, prevEntry.longitude], dt, true);
@@ -132,15 +135,23 @@ function processLocation(newLat, newLng, prevEntry, kalman, accuracy = null, tim
   }
 
   const filtered = kalman.update([newLat, newLng], dt, false);
-  const filteredLat = filtered[0];
-  const filteredLng = filtered[1];
+  let filteredLat = filtered[0];
+  let filteredLng = filtered[1];
+
+  // Multi-point smoothing — sliding window average after Kalman
+  if (userState && userState.window) {
+    userState.window.push(filteredLat, filteredLng);
+    const avg = userState.window.average();
+    filteredLat = avg.lat;
+    filteredLng = avg.lng;
+  }
 
   const filteredDist = haversineDistance(
     prevEntry.latitude, prevEntry.longitude,
     filteredLat, filteredLng
   );
 
-  if (filteredDist < STATIONARY_THRESHOLD) {
+  if (filteredDist < dynamicThreshold) {
     return { ...prevEntry, timestamp: now };
   }
 
@@ -178,6 +189,40 @@ function processLocation(newLat, newLng, prevEntry, kalman, accuracy = null, tim
   };
 }
 
+// ── Sliding Window for multi-point smoothing ───────────────────────
+class SlidingWindow {
+  constructor(size = 5) {
+    this.size = size;
+    this.buffer = [];
+  }
+
+  push(lat, lng) {
+    this.buffer.push({ lat, lng });
+    if (this.buffer.length > this.size) this.buffer.shift();
+  }
+
+  average() {
+    const len = this.buffer.length;
+    if (len === 0) return null;
+    if (len === 1) return { lat: this.buffer[0].lat, lng: this.buffer[0].lng };
+
+    let totalWeight = 0;
+    let latSum = 0;
+    let lngSum = 0;
+    for (let i = 0; i < len; i++) {
+      const weight = i + 1;
+      latSum += this.buffer[i].lat * weight;
+      lngSum += this.buffer[i].lng * weight;
+      totalWeight += weight;
+    }
+    return { lat: latSum / totalWeight, lng: lngSum / totalWeight };
+  }
+
+  reset() {
+    this.buffer = [];
+  }
+}
+
 // ── Per-user state cache ────────────────────────────────────────────
 const userStates = new Map();
 
@@ -186,6 +231,7 @@ function getUserState(userId) {
     userStates.set(userId, {
       prev: null,
       kalman: new KalmanFilter2D(),
+      window: new SlidingWindow(),
       smoothedLocation: null,
       previousLocation: null,
       previousTimestamp: null,
