@@ -6,7 +6,6 @@
   "scripts": {
     "start": "node src/index.js",
     "start:cluster": "node cluster.js",
-    "start:worker": "node run-worker.js",
     "dev": "node --watch src/index.js"
   },
   "keywords": [],

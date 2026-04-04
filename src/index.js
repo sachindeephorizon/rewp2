@@ -3,24 +3,32 @@
  *  Real-Time Location Tracking Backend
  * ═══════════════════════════════════════════════════════════════════
  *
- *  Architecture (with Redis Streams):
+ * Architecture:
  *
- *  Mobile App
- *    │  POST /:id/ping { lat, lng }
- *    ▼
- *  ┌──────────────────────────────────────────────────┐
- *  │  Express Server                                  │
- *  │    ├─ Redis SET  user:{userId}  (live location)  │
- *  │    ├─ Redis PUBLISH (Socket.io → dashboard)      │
- *  │    └─ Redis XADD location_stream (durable log)   │
- *  └──────────────────────────────────────────────────┘
- *       │                              │
- *       ▼ (real-time)                  ▼ (durable)
- *    Dashboard                   Stream Worker
- *    (Socket.io)                   │  XREADGROUP
- *                                  │  Batch 100 msgs
- *                                  ▼  INSERT INTO PostgreSQL
- *                                  │  XACK
+ *   Frontend (mobile/web)
+ *       │
+ *       │  POST /:id/ping  { lat, lng }  (every ~10s)
+ *       ▼
+ *   ┌──────────────────────────────────────────────────┐
+ *   │  Express Server (Instance A, B, C …)             │
+ *   │    ├─ Redis SET  user:{userId}  (TTL 60s)        │
+ *   │    └─ Redis PUBLISH "location_updates"           │
+ *   └──────────────────────────────────────────────────┘
+ *       │
+ *       ▼  (Redis Pub/Sub fans out to ALL instances)
+ *   ┌──────────────────────────────────────────────────┐
+ *   │  Redis Subscriber (per instance)                 │
+ *   │    └─ Socket.io  io.emit("locationUpdate", data) │
+ *   └──────────────────────────────────────────────────┘
+ *       │
+ *       ▼
+ *   Agent Dashboard (WebSocket clients)
+ *
+ * Horizontal scaling:
+ *   Run N instances behind a load balancer. Each has its own
+ *   Socket.io server + Redis subscriber. Because Redis Pub/Sub
+ *   delivers to every subscriber, ALL dashboard clients see
+ *   every update — no matter which instance received the POST.
  */
 
 require("dotenv").config();
@@ -32,8 +40,6 @@ const cors = require("cors");
 const { connectRedis } = require("./redis");
 const { connectDB } = require("./db");
 const { initSocket } = require("./socket");
-const { initStream } = require("./stream");
-const { startWorker, stopWorker } = require("./worker");
 const routes = require("./routes");
 
 const app = express();
@@ -60,38 +66,38 @@ app.get("/health", (_req, res) => {
 app.use("/", routes);
 
 // ── Server bootstrap ────────────────────────────────────────────────
+// We create a raw http.Server so both Express and Socket.io share
+// the same port (required by Socket.io).
 
 async function start() {
   await connectRedis();
   await connectDB();
-  await initStream();   // Create stream + consumer group
-  startWorker();        // Start stream consumer (in-process)
-
   const server = http.createServer(app);
   initSocket(server);
 
+  // 3. Start listening
   server.listen(PORT, () => {
     console.log("═══════════════════════════════════════════════════");
     console.log(`  Worker ${process.pid} | Port ${PORT}`);
-    console.log("  Stream: location_stream → location_workers");
     console.log("  Scaling: Redis adapter ✓ | Rate limiter ✓");
     console.log("═══════════════════════════════════════════════════");
 
-    // Self-ping to prevent Render/Railway from sleeping
+    // Self-ping every 13 minutes to prevent Render free tier from sleeping
     setInterval(() => {
       fetch(`http://localhost:${PORT}/health`).catch(() => {});
     }, 13 * 60 * 1000);
   });
 
   // ── Graceful shutdown ───────────────────────────────────────────
-  const shutdown = async (signal) => {
-    console.log(`\n[Server] ${signal} received, shutting down...`);
-    await stopWorker();   // Stop consuming, finish current batch
+  process.on("SIGINT", () => {
+    console.log("\n[Server] Shutting down gracefully...");
     server.close(() => process.exit(0));
-  };
+  });
 
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGTERM", () => {
+    console.log("\n[Server] SIGTERM received, shutting down...");
+    server.close(() => process.exit(0));
+  });
 }
 
 start().catch((err) => {
