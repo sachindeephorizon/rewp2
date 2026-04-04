@@ -81,6 +81,10 @@ async function connectDB() {
       ALTER TABLE sessions ALTER COLUMN ended_at DROP NOT NULL;
       ALTER TABLE sessions ALTER COLUMN duration_secs DROP NOT NULL;
 
+      -- is_active: true while tracking, false after stop
+      ALTER TABLE sessions ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT false;
+      CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(user_id, is_active) WHERE is_active = true;
+
       CREATE TABLE IF NOT EXISTS location_logs (
         id          SERIAL PRIMARY KEY,
         session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,

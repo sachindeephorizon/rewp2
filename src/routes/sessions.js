@@ -3,7 +3,7 @@ const { pool } = require("../db");
 
 const router = Router();
 
-const SESSION_FIELDS = `id, user_id, session_name, started_at, ended_at, duration_secs, total_pings, start_location, end_location, created_at`;
+const SESSION_FIELDS = `id, user_id, session_name, started_at, ended_at, duration_secs, total_pings, start_location, end_location, is_active, created_at`;
 
 // ── GET /sessions/all ────────────────────────────────────────────────
 
@@ -14,9 +14,9 @@ router.get("/all", async (req, res) => {
     const offset = (page - 1) * limit;
 
     const [countResult, result] = await Promise.all([
-      pool.query("SELECT COUNT(*) AS total FROM sessions"),
+      pool.query("SELECT COUNT(*) AS total FROM sessions WHERE is_active = false"),
       pool.query(
-        `SELECT ${SESSION_FIELDS} FROM sessions ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
+        `SELECT ${SESSION_FIELDS} FROM sessions WHERE is_active = false ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
         [limit, offset]
       ),
     ]);
@@ -109,9 +109,9 @@ router.get("/user/:id", async (req, res) => {
     const offset = (page - 1) * limit;
 
     const [countResult, result] = await Promise.all([
-      pool.query("SELECT COUNT(*) AS total FROM sessions WHERE user_id = $1", [id]),
+      pool.query("SELECT COUNT(*) AS total FROM sessions WHERE user_id = $1 AND is_active = false", [id]),
       pool.query(
-        `SELECT ${SESSION_FIELDS} FROM sessions WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+        `SELECT ${SESSION_FIELDS} FROM sessions WHERE user_id = $1 AND is_active = false ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
         [id, limit, offset]
       ),
     ]);
