@@ -1,5 +1,6 @@
 const { Router } = require("express");
 const { redis } = require("../redis");
+const { haversineDistance } = require("../utils/gps");
 const { ACTIVE_SET } = require("../config");
 
 const router = Router();
@@ -88,6 +89,37 @@ router.get("/:id/trail", async (req, res) => {
     });
   } catch (err) {
     console.error("[GET /user/:id/trail] Error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ── GET /user/:id/session-distance ──────────────────────────────────
+// Calculates total distance from the active Redis session logs.
+
+router.get("/:id/session-distance", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const logs = await redis.lRange(`session:${id}:logs`, 0, -1);
+
+    if (!logs || logs.length < 2) {
+      return res.status(200).json({ ok: true, distance: 0, points: logs ? logs.length : 0 });
+    }
+
+    let totalDistance = 0;
+    let prev = JSON.parse(logs[0]);
+
+    for (let i = 1; i < logs.length; i++) {
+      const curr = JSON.parse(logs[i]);
+      const d = haversineDistance(prev.lat, prev.lng, curr.lat, curr.lng);
+      if (d < 100) { // skip jumps > 100m (noise)
+        totalDistance += d;
+      }
+      prev = curr;
+    }
+
+    return res.status(200).json({ ok: true, distance: totalDistance, points: logs.length });
+  } catch (err) {
+    console.error("[GET /user/:id/session-distance] Error:", err.message);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
