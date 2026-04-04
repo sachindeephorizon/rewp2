@@ -78,11 +78,15 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       }
     }
 
+    // existingSession = start time for continuing session, now for new session
+    const sessionStartedAt = existingSession || now;
+
     const payload = {
       userId,
       lat: finalLat,
       lng: finalLng,
       timestamp: now,
+      startedAt: sessionStartedAt,
     };
 
     const locationPoint = JSON.stringify({
