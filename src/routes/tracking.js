@@ -5,11 +5,17 @@ const { processLocation, getUserState, clearUserState, haversineDistance } = req
 const { reverseGeocode } = require("../utils/geocode");
 const { rateLimitPing } = require("../utils/rateLimit");
 const { snapToRoad, snapTrajectory } = require("../utils/snapToRoad");
-const { LOCATION_TTL, SESSION_TTL, TRAIL_MIN_DISTANCE, CHANNEL, ACTIVE_SET } = require("../config");
+const {
+  LOCATION_TTL, SESSION_TTL, TRAIL_MIN_DISTANCE,
+  CHANNEL, ACTIVE_SET, STREAM_NAME,
+} = require("../config");
 
 const router = Router();
 
 // ── POST /:id/ping ──────────────────────────────────────────────────
+// Real-time: SET + PUBLISH (unchanged)
+// Logging:   XADD to Redis Stream (replaces RPUSH)
+// Session:   Created in PostgreSQL on first ping (not on stop)
 
 router.post("/:id/ping", rateLimitPing, async (req, res) => {
   try {
@@ -39,7 +45,6 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       return res.status(200).json({ ok: true, filtered: true, reason: "GPS spike rejected" });
     }
 
-    // Detect real movement — if position unchanged from previous, it's stationary
     const prevState = state.prev;
     const isRealMovement = !prevState ||
       prevState.latitude !== processed.latitude ||
@@ -47,7 +52,7 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
 
     state.prev = processed;
 
-    // Road snap — snap processed coordinates to nearest road (non-blocking)
+    // Road snap
     const snapped = isRealMovement
       ? await snapToRoad(processed.latitude, processed.longitude)
       : { lat: processed.latitude, lng: processed.longitude, snapped: false };
@@ -56,17 +61,88 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
 
     const now = new Date().toISOString();
     const redisKey = `user:${userId}`;
+    const sessionIdKey = `session:${userId}:id`;       // PG session ID
     const sessionStartKey = `session:${userId}:start`;
-    const sessionLogsKey = `session:${userId}:logs`;
     const trailKey = `trail:${userId}`;
     const startMarkerKey = `marker:${userId}:start`;
 
-    // Check if this user already has an active session in Redis
-    // (survives server restarts — in-memory GPS state doesn't)
-    const existingSession = await redis.get(sessionStartKey);
-    const isFirstPing = !existingSession;
+    // Check if active session exists
+    let sessionId = await redis.get(sessionIdKey);
+    const isFirstPing = !sessionId;
 
-    // Trail dot — only add if moved enough since last dot
+    // ── First ping: create session in PostgreSQL ──
+    if (isFirstPing) {
+      // Save any orphan session from previous crash
+      const oldSessionId = await redis.get(sessionIdKey);
+      if (oldSessionId) {
+        try {
+          await pool.query(
+            `UPDATE sessions SET ended_at = $1, duration_secs = EXTRACT(EPOCH FROM ($1::timestamptz - started_at))::int
+             WHERE id = $2 AND ended_at IS NULL`,
+            [now, parseInt(oldSessionId, 10)]
+          );
+        } catch {}
+      }
+
+      // Count existing sessions for naming
+      const countResult = await pool.query(
+        "SELECT COUNT(*) AS cnt FROM sessions WHERE user_id = $1",
+        [userId]
+      );
+      const num = parseInt(countResult.rows[0].cnt, 10) + 1;
+      const sessionName = `session${num}`;
+
+      // Create active session (ended_at = NULL)
+      const sessionResult = await pool.query(
+        `INSERT INTO sessions (user_id, session_name, started_at, ended_at, duration_secs, total_pings)
+         VALUES ($1, $2, $3, NULL, 0, 0)
+         RETURNING id`,
+        [userId, sessionName, now]
+      );
+      sessionId = String(sessionResult.rows[0].id);
+
+      // Store session ID + start time in Redis
+      await Promise.all([
+        redis.set(sessionIdKey, sessionId),
+        redis.expire(sessionIdKey, SESSION_TTL),
+        redis.set(sessionStartKey, now),
+        redis.expire(sessionStartKey, SESSION_TTL),
+        redis.del(trailKey),
+        redis.set(startMarkerKey, JSON.stringify({ lat: finalLat, lng: finalLng, timestamp: now })),
+        redis.expire(startMarkerKey, SESSION_TTL),
+      ]);
+
+      console.log(`[ping] New session: ${sessionName} (id=${sessionId}) for ${userId}`);
+    }
+
+    // ── XADD to Redis Stream (replaces RPUSH) ──
+    await redis.xAdd(STREAM_NAME, "*", {
+      userId,
+      sessionId,
+      lat: String(finalLat),
+      lng: String(finalLng),
+      accuracy: String(userAccuracy || 0),
+      ts: now,
+    });
+
+    // ── Real-time: SET + PUBLISH (unchanged) ──
+    const payload = {
+      userId,
+      lat: finalLat,
+      lng: finalLng,
+      timestamp: now,
+    };
+
+    const redisOps = [
+      redis.setEx(redisKey, LOCATION_TTL, JSON.stringify(payload)),
+      redis.sAdd(ACTIVE_SET, userId),
+    ];
+
+    if (isRealMovement || isFirstPing) {
+      redisOps.push(redis.publish(CHANNEL, JSON.stringify(payload)));
+    }
+
+    // Trail dots
     let addTrailDot = false;
     const lastDotRaw = await redis.lIndex(trailKey, -1);
     if (!lastDotRaw) {
@@ -78,96 +154,9 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       }
     }
 
-    const payload = {
-      userId,
-      lat: finalLat,
-      lng: finalLng,
-      timestamp: now,
-    };
-
-    const locationPoint = JSON.stringify({
-      lat: finalLat,
-      lng: finalLng,
-      timestamp: now,
-    });
-
-    const redisOps = [
-      redis.setEx(redisKey, LOCATION_TTL, JSON.stringify(payload)),
-      redis.sAdd(ACTIVE_SET, userId),
-    ];
-
-    // Only emit to dashboard when there's real movement or first ping
-    if (isRealMovement || isFirstPing) {
-      redisOps.push(redis.publish(CHANNEL, JSON.stringify(payload)));
-    }
-
-    if (isFirstPing) {
-      // If there's leftover session data from a previous session that was
-      // never stopped (e.g. server restarted, app crashed), save it to DB
-      // before clearing so it's not lost.
-      try {
-        const [oldStart, oldLogs] = await Promise.all([
-          redis.get(sessionStartKey),
-          redis.lRange(sessionLogsKey, 0, -1),
-        ]);
-        if (oldStart && oldLogs && oldLogs.length > 0) {
-          const parsedOldLogs = oldLogs.map((l) => JSON.parse(l));
-          const oldSessionStart = new Date(oldStart);
-          const oldNow = new Date();
-          const oldDuration = Math.floor((oldNow - oldSessionStart) / 1000);
-          const countRes = await pool.query("SELECT COUNT(*) AS cnt FROM sessions WHERE user_id = $1", [userId]);
-          const num = parseInt(countRes.rows[0].cnt, 10) + 1;
-          const oldName = `session${num}`;
-
-          const firstOld = parsedOldLogs[0];
-          const lastOld = parsedOldLogs[parsedOldLogs.length - 1];
-          const [startLoc, endLoc] = await Promise.all([
-            firstOld ? reverseGeocode(firstOld.lat, firstOld.lng) : null,
-            lastOld ? reverseGeocode(lastOld.lat, lastOld.lng) : null,
-          ]);
-
-          const sResult = await pool.query(
-            `INSERT INTO sessions (user_id, session_name, started_at, ended_at, duration_secs, total_pings, start_location, end_location)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-            [userId, oldName, oldSessionStart, oldNow, oldDuration, parsedOldLogs.length, startLoc, endLoc]
-          );
-          const oldSid = sResult.rows[0].id;
-          const BATCH = 500;
-          for (let b = 0; b < parsedOldLogs.length; b += BATCH) {
-            const batch = parsedOldLogs.slice(b, b + BATCH);
-            const vals = [], params = [];
-            batch.forEach((p, i) => {
-              const o = i * 4;
-              vals.push(`($${o+1},$${o+2},$${o+3},$${o+4})`);
-              params.push(oldSid, p.lat, p.lng, p.timestamp);
-            });
-            await pool.query(`INSERT INTO location_logs (session_id, lat, lng, recorded_at) VALUES ${vals.join(",")}`, params);
-          }
-          console.log(`[ping] Auto-saved orphan session: ${oldName} | ${parsedOldLogs.length} pts`);
-        }
-      } catch (e) {
-        console.error("[ping] Failed to save orphan session:", e.message);
-      }
-
-      // Now clear and start fresh
-      redisOps.push(redis.del(sessionLogsKey));
-      redisOps.push(redis.del(trailKey));
-      redisOps.push(redis.set(sessionStartKey, now));
-      redisOps.push(redis.expire(sessionStartKey, SESSION_TTL));
-      redisOps.push(redis.rPush(sessionLogsKey, locationPoint));
-      redisOps.push(redis.expire(sessionLogsKey, SESSION_TTL));
-      const startMarker = JSON.stringify({ lat: processed.latitude, lng: processed.longitude, timestamp: now });
-      redisOps.push(redis.set(startMarkerKey, startMarker));
-      redisOps.push(redis.expire(startMarkerKey, SESSION_TTL));
-    } else {
-      redisOps.push(redis.rPush(sessionLogsKey, locationPoint));
-      redisOps.push(redis.expire(sessionLogsKey, SESSION_TTL));
-      redisOps.push(redis.expire(trailKey, SESSION_TTL));
-    }
-
     if (addTrailDot) {
-      const trailDot = JSON.stringify({ lat: processed.latitude, lng: processed.longitude, timestamp: now });
-      redisOps.push(redis.rPush(trailKey, trailDot));
+      redisOps.push(redis.rPush(trailKey, JSON.stringify({ lat: finalLat, lng: finalLng, timestamp: now })));
+      redisOps.push(redis.expire(trailKey, SESSION_TTL));
     }
 
     await Promise.all(redisOps);
@@ -180,87 +169,88 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
 });
 
 // ── POST /:id/stop ──────────────────────────────────────────────────
+// With streams, location_logs are already in PostgreSQL (inserted by worker).
+// Stop just finalizes the session record + cleans up Redis.
 
 router.post("/:id/stop", async (req, res) => {
   try {
     const userId = req.params.id;
     const now = new Date();
+    const sessionIdKey = `session:${userId}:id`;
     const sessionStartKey = `session:${userId}:start`;
-    const sessionLogsKey = `session:${userId}:logs`;
     const trailKey = `trail:${userId}`;
     const startMarkerKey = `marker:${userId}:start`;
 
-    const [startedAt, logs, trailDots, startMarkerRaw] = await Promise.all([
+    const [sessionId, startedAt, trailDots, startMarkerRaw] = await Promise.all([
+      redis.get(sessionIdKey),
       redis.get(sessionStartKey),
-      redis.lRange(sessionLogsKey, 0, -1),
       redis.lRange(trailKey, 0, -1),
       redis.get(startMarkerKey),
     ]);
 
-    const countResult = await pool.query(
-      "SELECT COUNT(*) AS cnt FROM sessions WHERE user_id = $1",
-      [userId]
-    );
-    const sessionNumber = parseInt(countResult.rows[0].cnt, 10) + 1;
-    const sessionName = `session${sessionNumber}`;
+    if (!sessionId) {
+      return res.status(200).json({ ok: true, message: "No active session" });
+    }
 
+    const sid = parseInt(sessionId, 10);
     const sessionStart = startedAt ? new Date(startedAt) : now;
     const durationSecs = Math.floor((now - sessionStart) / 1000);
-    const parsedLogs = logs.map((l) => JSON.parse(l));
 
-    // Geocode start and end locations
-    const firstLog = parsedLogs[0];
-    const lastLog = parsedLogs[parsedLogs.length - 1];
+    // Count how many logs the worker has inserted for this session
+    const countResult = await pool.query(
+      "SELECT COUNT(*) AS cnt FROM location_logs WHERE session_id = $1",
+      [sid]
+    );
+    const totalPings = parseInt(countResult.rows[0].cnt, 10);
+
+    // Get first and last log for geocoding
+    const [firstLogResult, lastLogResult] = await Promise.all([
+      pool.query(
+        "SELECT lat, lng FROM location_logs WHERE session_id = $1 ORDER BY recorded_at ASC LIMIT 1",
+        [sid]
+      ),
+      pool.query(
+        "SELECT lat, lng FROM location_logs WHERE session_id = $1 ORDER BY recorded_at DESC LIMIT 1",
+        [sid]
+      ),
+    ]);
+
+    const firstLog = firstLogResult.rows[0];
+    const lastLog = lastLogResult.rows[0];
+
     const [startLocation, endLocation] = await Promise.all([
       firstLog ? reverseGeocode(firstLog.lat, firstLog.lng) : null,
       lastLog ? reverseGeocode(lastLog.lat, lastLog.lng) : null,
     ]);
 
-    const sessionResult = await pool.query(
-      `INSERT INTO sessions (user_id, session_name, started_at, ended_at, duration_secs, total_pings, start_location, end_location)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING id`,
-      [userId, sessionName, sessionStart, now, durationSecs, parsedLogs.length, startLocation, endLocation]
+    // Finalize the session — update ended_at, duration, pings, locations
+    await pool.query(
+      `UPDATE sessions
+       SET ended_at = $1, duration_secs = $2, total_pings = $3,
+           start_location = $4, end_location = $5
+       WHERE id = $6`,
+      [now, durationSecs, totalPings, startLocation, endLocation, sid]
     );
-    const sessionId = sessionResult.rows[0].id;
-
-    // Bulk insert location logs
-    const BATCH_SIZE = 500;
-    for (let b = 0; b < parsedLogs.length; b += BATCH_SIZE) {
-      const batch = parsedLogs.slice(b, b + BATCH_SIZE);
-      const values = [];
-      const params = [];
-      batch.forEach((point, i) => {
-        const offset = i * 4;
-        values.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4})`);
-        params.push(sessionId, point.lat, point.lng, point.timestamp);
-      });
-      await pool.query(
-        `INSERT INTO location_logs (session_id, lat, lng, recorded_at) VALUES ${values.join(", ")}`,
-        params
-      );
-    }
 
     console.log(
-      `[POST /${userId}/stop] Flushed: ${sessionName} | ${parsedLogs.length} points | ${durationSecs}s`
+      `[POST /${userId}/stop] Finalized: session ${sid} | ${totalPings} points | ${durationSecs}s`
     );
 
     clearUserState(userId);
 
-    const finalLog = parsedLogs[parsedLogs.length - 1];
-    const stopMarker = finalLog ? { lat: finalLog.lat, lng: finalLog.lng } : null;
+    const stopMarker = lastLog ? { lat: lastLog.lat, lng: lastLog.lng } : null;
     const startMarker = startMarkerRaw ? JSON.parse(startMarkerRaw) : null;
     const rawTrail = trailDots.map((d) => JSON.parse(d));
 
-    // Snap entire trail to roads for smooth playback
     const parsedTrail = rawTrail.length >= 2
       ? await snapTrajectory(rawTrail)
       : rawTrail;
 
+    // Clean up Redis
     await Promise.all([
       redis.del(`user:${userId}`),
+      redis.del(sessionIdKey),
       redis.del(sessionStartKey),
-      redis.del(sessionLogsKey),
       redis.del(trailKey),
       redis.del(startMarkerKey),
       redis.sRem(ACTIVE_SET, userId),
@@ -270,9 +260,9 @@ router.post("/:id/stop", async (req, res) => {
     return res.status(200).json({
       ok: true,
       session: {
-        id: sessionId, name: sessionName, userId,
+        id: sid, userId,
         startedAt: sessionStart, endedAt: now,
-        durationSecs, totalPings: parsedLogs.length,
+        durationSecs, totalPings,
         startLocation, endLocation,
         startMarker, stopMarker,
         trail: parsedTrail,

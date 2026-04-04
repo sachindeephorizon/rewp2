@@ -1,5 +1,6 @@
 const { Router } = require("express");
 const { redis } = require("../redis");
+const { pool } = require("../db");
 const { haversineDistance } = require("../utils/gps");
 const { ACTIVE_SET } = require("../config");
 
@@ -94,27 +95,35 @@ router.get("/:id/trail", async (req, res) => {
 });
 
 // ── GET /user/:id/session-distance ──────────────────────────────────
-// Calculates total distance from the active Redis session logs.
+// Calculates total distance from the active session's logs in PostgreSQL.
 
 router.get("/:id/session-distance", async (req, res) => {
   try {
     const { id } = req.params;
-    const logs = await redis.lRange(`session:${id}:logs`, 0, -1);
 
-    if (!logs || logs.length < 2) {
-      return res.status(200).json({ ok: true, distance: 0, points: logs ? logs.length : 0 });
+    // Get active session ID from Redis
+    const sessionId = await redis.get(`session:${id}:id`);
+    if (!sessionId) {
+      return res.status(200).json({ ok: true, distance: 0, points: 0 });
+    }
+
+    const sid = parseInt(sessionId, 10);
+    const result = await pool.query(
+      "SELECT lat, lng FROM location_logs WHERE session_id = $1 ORDER BY recorded_at ASC",
+      [sid]
+    );
+
+    const logs = result.rows;
+    if (logs.length < 2) {
+      return res.status(200).json({ ok: true, distance: 0, points: logs.length });
     }
 
     let totalDistance = 0;
-    let prev = JSON.parse(logs[0]);
-
     for (let i = 1; i < logs.length; i++) {
-      const curr = JSON.parse(logs[i]);
-      const d = haversineDistance(prev.lat, prev.lng, curr.lat, curr.lng);
-      if (d < 100) { // skip jumps > 100m (noise)
+      const d = haversineDistance(logs[i - 1].lat, logs[i - 1].lng, logs[i].lat, logs[i].lng);
+      if (d < 500) { // skip jumps > 500m (match MAX_JUMP)
         totalDistance += d;
       }
-      prev = curr;
     }
 
     return res.status(200).json({ ok: true, distance: totalDistance, points: logs.length });

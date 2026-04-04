@@ -77,13 +77,22 @@ async function connectDB() {
       ALTER TABLE sessions ADD COLUMN IF NOT EXISTS start_location VARCHAR(255);
       ALTER TABLE sessions ADD COLUMN IF NOT EXISTS end_location VARCHAR(255);
 
+      -- sessions.ended_at is now nullable — NULL means active session
+      ALTER TABLE sessions ALTER COLUMN ended_at DROP NOT NULL;
+      ALTER TABLE sessions ALTER COLUMN duration_secs DROP NOT NULL;
+
       CREATE TABLE IF NOT EXISTS location_logs (
         id          SERIAL PRIMARY KEY,
         session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
         lat         DOUBLE PRECISION NOT NULL,
         lng         DOUBLE PRECISION NOT NULL,
-        recorded_at TIMESTAMPTZ NOT NULL
+        recorded_at TIMESTAMPTZ NOT NULL,
+        stream_id   VARCHAR(64)
       );
+
+      -- For idempotency — prevent duplicate inserts from stream retries
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_location_logs_stream_id
+        ON location_logs(stream_id) WHERE stream_id IS NOT NULL;
 
       CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
       CREATE INDEX IF NOT EXISTS idx_location_logs_session_id ON location_logs(session_id);
