@@ -25,8 +25,14 @@ class KalmanFilter2D {
     this.x = null;
     this.v = [0, 0];
     this.P = 1;
-    this.Q = 0.00001;
-    this.R = 0.0001;
+    // FIX: Q increased 0.00001 → 0.0001 (trust GPS measurement more,
+    // prediction less). Old value made filter over-trust velocity prediction
+    // on curves → points cut corners instead of following the road.
+    this.Q = 0.0001;
+    // FIX: R increased 0.0001 → 0.001 (allow more correction toward
+    // actual GPS reading). Combined with higher Q, filter now follows
+    // real movement more closely instead of smoothing over turns.
+    this.R = 0.001;
     this.stationaryCount = 0;
   }
 
@@ -91,8 +97,8 @@ class KalmanFilter2D {
     this.x = data.x ?? null;
     this.v = data.v ?? [0, 0];
     this.P = data.P ?? 1;
-    this.Q = data.Q ?? 0.00001;
-    this.R = data.R ?? 0.0001;
+    this.Q = data.Q ?? 0.0001;
+    this.R = data.R ?? 0.001;
     this.stationaryCount = data.stationaryCount ?? 0;
   }
 }
