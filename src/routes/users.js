@@ -5,11 +5,9 @@ const { ACTIVE_SET } = require("../config");
 
 const router = Router();
 
-// ── GET /users/active ────────────────────────────────────────────────
-
 router.get("/active", async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
     const cursor = req.query.cursor || "0";
 
     const scanResult = await redis.sScan(ACTIVE_SET, cursor, { COUNT: limit });
@@ -22,10 +20,12 @@ router.get("/active", async (req, res) => {
 
     const locationKeys = userIds.map((id) => `user:${id}`);
     const sessionKeys = userIds.map((id) => `session:${id}:start`);
+    const metaKeys = userIds.map((id) => `session:${id}:meta`);
 
-    const [locationValues, sessionValues] = await Promise.all([
+    const [locationValues, sessionValues, metaValues] = await Promise.all([
       redis.mGet(locationKeys),
       redis.mGet(sessionKeys),
+      redis.mGet(metaKeys),
     ]);
 
     const users = [];
@@ -34,25 +34,24 @@ router.get("/active", async (req, res) => {
     for (let i = 0; i < userIds.length; i++) {
       const hasLocation = !!locationValues[i];
       const hasSession = !!sessionValues[i];
+      const meta = metaValues[i] ? JSON.parse(metaValues[i]) : null;
 
       if (hasLocation) {
-        // Normal case — location key fresh, use it directly
-        users.push(JSON.parse(locationValues[i]));
+        users.push({
+          ...JSON.parse(locationValues[i]),
+          sessionMeta: meta,
+        });
       } else if (hasSession) {
-        // FIX: location key expired (screen off > 30min or brief gap)
-        // but session is still active (session key has 24hr TTL).
-        // Don't remove from ACTIVE_SET — user is still tracking.
-        // Return a placeholder so dashboard keeps showing them.
         users.push({
           userId: userIds[i],
           lat: null,
           lng: null,
           timestamp: null,
           startedAt: sessionValues[i],
-          stale: true, // dashboard can show "last seen" indicator
+          sessionMeta: meta,
+          stale: true,
         });
       } else {
-        // No location AND no session — truly stale, safe to remove
         staleIds.push(userIds[i]);
       }
     }
@@ -76,7 +75,41 @@ router.get("/active", async (req, res) => {
   }
 });
 
-// ── GET /user/:id ───────────────────────────────────────────────────
+router.get("/:id/stream", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id || typeof id !== "string") {
+      return res.status(400).json({ error: "Invalid user id" });
+    }
+
+    const [rawLocation, trailDots, startMarkerRaw, sessionStartedAt, sessionMetaRaw] = await Promise.all([
+      redis.get(`user:${id}`),
+      redis.lRange(`trail:${id}`, 0, -1),
+      redis.get(`marker:${id}:start`),
+      redis.get(`session:${id}:start`),
+      redis.get(`session:${id}:meta`),
+    ]);
+
+    if (!rawLocation && !sessionStartedAt) {
+      return res.status(404).json({ error: "No active stream found for this user" });
+    }
+
+    const location = rawLocation ? JSON.parse(rawLocation) : null;
+    const sessionMeta = sessionMetaRaw ? JSON.parse(sessionMetaRaw) : null;
+
+    return res.status(200).json({
+      ok: true,
+      data: location,
+      sessionMeta,
+      startedAt: sessionStartedAt,
+      startMarker: startMarkerRaw ? JSON.parse(startMarkerRaw) : null,
+      trail: trailDots.map((dot) => JSON.parse(dot)),
+    });
+  } catch (err) {
+    console.error("[GET /user/:id/stream] Error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 router.get("/:id", async (req, res) => {
   try {
@@ -94,8 +127,6 @@ router.get("/:id", async (req, res) => {
     return res.status(500).json({ error: "Internal server error" });
   }
 });
-
-// ── GET /user/:id/trail ──────────────────────────────────────────────
 
 router.get("/:id/trail", async (req, res) => {
   try {
@@ -116,8 +147,6 @@ router.get("/:id/trail", async (req, res) => {
   }
 });
 
-// ── GET /user/:id/session-distance ──────────────────────────────────
-
 router.get("/:id/session-distance", async (req, res) => {
   try {
     const { id } = req.params;
@@ -130,7 +159,7 @@ router.get("/:id/session-distance", async (req, res) => {
     let totalDistance = 0;
     let prev = JSON.parse(logs[0]);
 
-    for (let i = 1; i < logs.length; i++) {
+    for (let i = 1; i < logs.length; i += 1) {
       const curr = JSON.parse(logs[i]);
       const d = haversineDistance(prev.lat, prev.lng, curr.lat, curr.lng);
       if (d < 100) {
