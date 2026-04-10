@@ -4,6 +4,7 @@ const { Router } = require("express");
 const { redis } = require("../redis");
 const { SESSION_TTL } = require("../config");
 const { fetchOsrmRoute } = require("../utils/osrmRoute");
+const h3 = require("h3-js");
 const { buildH3Corridor } = require("../utils/h3corridor");
 
 const router = Router();
@@ -123,7 +124,22 @@ router.get("/:id", async (req, res) => {
     }
     if (req.query.includeCorridor === "true") {
       const corridorRaw = await redis.get(corridorKey(userId));
-      if (corridorRaw) corridor = JSON.parse(corridorRaw);
+      if (corridorRaw) {
+        const cells = JSON.parse(corridorRaw);
+        // Convert H3 indices to GeoJSON FeatureCollection so the dashboard
+        // doesn't need h3-js (WASM issues in Next.js).
+        const features = cells.map((cellIndex) => {
+          const boundary = h3.cellToBoundary(cellIndex); // [[lat,lng], ...]
+          const ring = boundary.map(([lat, lng]) => [lng, lat]);
+          ring.push(ring[0]); // close the ring
+          return {
+            type: "Feature",
+            properties: { h3: cellIndex },
+            geometry: { type: "Polygon", coordinates: [ring] },
+          };
+        });
+        corridor = { type: "FeatureCollection", features };
+      }
     }
 
     return res.status(200).json({
