@@ -11,7 +11,9 @@ const router = Router();
 
 // Redis key helpers
 const destKey = (userId) => `nav:dest:${userId}`;
-const corridorKey = (userId) => `nav:corridor:${userId}`;
+const corridorKey = (userId) => `nav:corridor:${userId}`;  // kept for dashboard viz
+const innerKey = (userId) => `nav:inner:${userId}`;         // Redis SET — O(1) lookups
+const outerKey = (userId) => `nav:outer:${userId}`;         // Redis SET — O(1) lookups
 const routeKey = (userId) => `nav:route:${userId}`;
 
 /**
@@ -41,9 +43,12 @@ router.post("/:id/set", async (req, res) => {
     // 1. Fetch OSRM route
     const { route, distance, duration } = await fetchOsrmRoute(origin, destination);
 
-    // 2. Build H3 corridor (runs in <50ms for typical city routes)
-    const corridorCells = buildH3Corridor(route, 9);
-    const corridorSet = corridorCells; // store as array, phone never sees it
+    // 2. Build dual H3 corridors
+    //    Inner (k=1, ~150m) → safe zone
+    //    Outer (k=2, ~300m) → buffer / noise zone
+    //    Outside outer → deviation
+    const innerCells = buildH3Corridor(route, { resolution: 9, buffer: 1 });
+    const outerCells = buildH3Corridor(route, { resolution: 9, buffer: 2 });
 
     // 3. Store in Redis with session-level TTL
     const destData = {
@@ -55,15 +60,30 @@ router.post("/:id/set", async (req, res) => {
       setAt: new Date().toISOString(),
     };
 
+    // Clear any previous corridor sets first
+    await Promise.all([
+      redis.del(innerKey(userId)),
+      redis.del(outerKey(userId)),
+    ]);
+
     await Promise.all([
       redis.set(destKey(userId), JSON.stringify(destData), { EX: SESSION_TTL }),
-      redis.set(corridorKey(userId), JSON.stringify(corridorSet), { EX: SESSION_TTL }),
+      redis.set(corridorKey(userId), JSON.stringify(outerCells), { EX: SESSION_TTL }), // for dashboard viz
       redis.set(routeKey(userId), JSON.stringify(route), { EX: SESSION_TTL }),
+      // Store as Redis SETs for O(1) sIsMember lookups during ping deviation checks
+      innerCells.length > 0 ? redis.sAdd(innerKey(userId), innerCells) : Promise.resolve(),
+      outerCells.length > 0 ? redis.sAdd(outerKey(userId), outerCells) : Promise.resolve(),
+    ]);
+
+    // Set TTL on the sets
+    await Promise.all([
+      redis.expire(innerKey(userId), SESSION_TTL),
+      redis.expire(outerKey(userId), SESSION_TTL),
     ]);
 
     console.log(
       `[destination] ${userId} → ${destination.lat.toFixed(4)},${destination.lng.toFixed(4)} | ` +
-      `${route.length} pts | ${corridorCells.length} h3 cells | ${(distance / 1000).toFixed(1)}km`
+      `${route.length} pts | inner=${innerCells.length} outer=${outerCells.length} h3 cells | ${(distance / 1000).toFixed(1)}km`
     );
 
     // 4. Return only what the phone needs — distance + duration
@@ -90,6 +110,8 @@ router.post("/:id/clear", async (req, res) => {
     await Promise.all([
       redis.del(destKey(userId)),
       redis.del(corridorKey(userId)),
+      redis.del(innerKey(userId)),
+      redis.del(outerKey(userId)),
       redis.del(routeKey(userId)),
     ]);
     return res.status(200).json({ ok: true });

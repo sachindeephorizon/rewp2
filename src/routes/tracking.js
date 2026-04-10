@@ -14,6 +14,10 @@ const { reverseGeocode } = require("../utils/geocode");
 const { rateLimitPing } = require("../utils/rateLimit");
 const { snapToRoad, snapTrajectory } = require("../utils/snapToRoad");
 const { latLngToH3Cell } = require("../utils/h3corridor");
+
+// In-memory deviation streak counters (per userId). Reset on server restart,
+// which is fine — a restart is a natural "reset" event.
+const deviationState = new Map(); // userId → { count: number }
 const {
   LOCATION_TTL,
   SESSION_TTL,
@@ -310,8 +314,115 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
 
     await Promise.all(redisOps);
 
+    // ── Deviation detection ─────────────────────────────────────────
+    // Only runs when the user has an active destination with corridors.
+    // Zone logic:
+    //   inner (k=1, ~150m) → SAFE
+    //   outer (k=2, ~300m) but not inner → BUFFER (GPS noise, ignore)
+    //   outside outer → OUTSIDE → if 3 consecutive → DEVIATED 🚨
+    let deviationAlert = null;
+
+    const hasDestination = await redis.exists(`nav:dest:${userId}`);
+    if (hasDestination) {
+      const inInner = await redis.sIsMember(`nav:inner:${userId}`, h3Cell);
+
+      if (inInner) {
+        // Safe — reset streak
+        deviationState.set(userId, { count: 0 });
+        // If there was an active deviation, mark it resolved
+        const activeDevKey = `deviation:${userId}`;
+        const activeDev = await redis.get(activeDevKey);
+        if (activeDev) {
+          await redis.del(activeDevKey);
+          // Resolve in DB (best-effort)
+          pool.query(
+            `UPDATE deviations SET resolved_at = NOW() WHERE user_id = $1 AND resolved_at IS NULL`,
+            [userId]
+          ).catch(() => {});
+        }
+      } else {
+        const inOuter = await redis.sIsMember(`nav:outer:${userId}`, h3Cell);
+
+        if (inOuter) {
+          // Buffer zone — don't increment, don't reset (hysteresis)
+          // This absorbs GPS noise at corridor edges
+        } else {
+          // OUTSIDE — increment streak
+          const s = deviationState.get(userId) || { count: 0 };
+          s.count++;
+          deviationState.set(userId, s);
+
+          if (s.count >= 3) {
+            // 🚨 DEVIATED — log to DB, alert dashboard
+            const destRaw = await redis.get(`nav:dest:${userId}`);
+            const destData = destRaw ? JSON.parse(destRaw) : {};
+
+            // Compute approximate distance from route
+            const routeRaw = await redis.get(`nav:route:${userId}`);
+            let distFromRoute = null;
+            if (routeRaw) {
+              const routePts = JSON.parse(routeRaw);
+              let minDist = Infinity;
+              for (let i = 0; i < routePts.length; i++) {
+                const d = haversineDistance(finalLat, finalLng, routePts[i].lat, routePts[i].lng);
+                if (d < minDist) minDist = d;
+              }
+              distFromRoute = Math.round(minDist);
+            }
+
+            // Find active session ID in DB (best-effort)
+            let dbSessionId = null;
+            try {
+              const sessionMeta = streamMeta.sessionId;
+              if (sessionMeta) {
+                const sr = await pool.query(
+                  `SELECT id FROM sessions WHERE session_name = $1 ORDER BY id DESC LIMIT 1`,
+                  [sessionMeta]
+                );
+                if (sr.rows.length) dbSessionId = sr.rows[0].id;
+              }
+            } catch {}
+
+            // Insert deviation record
+            try {
+              await pool.query(
+                `INSERT INTO deviations (user_id, session_id, lat, lng, h3_cell, distance_from_route, zone, consecutive, destination_name)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                [userId, dbSessionId, finalLat, finalLng, h3Cell, distFromRoute, 'OUTSIDE', s.count, destData.name || null]
+              );
+            } catch (e) {
+              console.error("[deviation] DB insert failed:", e.message);
+            }
+
+            // Store active deviation in Redis for dashboard polling
+            const devPayload = {
+              userId,
+              lat: finalLat,
+              lng: finalLng,
+              h3Cell,
+              distanceFromRoute: distFromRoute,
+              consecutive: s.count,
+              destinationName: destData.name || null,
+              detectedAt: now,
+            };
+            await redis.set(`deviation:${userId}`, JSON.stringify(devPayload), { EX: SESSION_TTL });
+
+            // Publish deviation alert via the same pub/sub channel
+            await redis.publish(CHANNEL, JSON.stringify({
+              event: "deviation_alert",
+              ...devPayload,
+              roomNames: streamMeta.roomNames,
+              streamKey: streamMeta.streamKey,
+            }));
+
+            deviationAlert = devPayload;
+            console.log(`[deviation] 🚨 ${userId} deviated | ${distFromRoute}m from route | streak=${s.count}`);
+          }
+        }
+      }
+    }
+
     // Check for a pending force-location request from an agent.
-    // If the phone just responded to one (source === "force_request"), clear it.
     const locReqKey = `locreq:${userId}`;
     let forceRefresh = false;
 
@@ -322,7 +433,7 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       if (pending) forceRefresh = true;
     }
 
-    return res.status(200).json({ ok: true, data: payload, forceRefresh });
+    return res.status(200).json({ ok: true, data: payload, forceRefresh, deviationAlert });
   } catch (err) {
     console.error("[POST /:id/ping] Error:", err.message);
     return res.status(500).json({ error: "Internal server error" });
@@ -424,7 +535,10 @@ router.post("/:id/stop", async (req, res) => {
       redis.del(startMarkerKey),
       redis.del(`nav:dest:${userId}`),
       redis.del(`nav:corridor:${userId}`),
+      redis.del(`nav:inner:${userId}`),
+      redis.del(`nav:outer:${userId}`),
       redis.del(`nav:route:${userId}`),
+      redis.del(`deviation:${userId}`),
       redis.sRem(ACTIVE_SET, userId),
       redis.publish(CHANNEL, JSON.stringify(stopPayload)),
     ]);

@@ -69,31 +69,31 @@ function latLngToH3Cell(lat, lng, resolution = DEFAULT_RES) {
  * Build an H3 corridor from an OSRM-decoded route.
  *
  * @param {Array<{lat: number, lng: number}>} routePoints
- * @param {number} [resolution=9]  H3 resolution (default 9, ~174 m edge)
+ * @param {object} [opts]
+ * @param {number} [opts.resolution=9]  H3 resolution (default 9, ~174 m edge)
+ * @param {number} [opts.buffer=1]      gridDisk k-ring radius (1 ≈ 150m, 2 ≈ 300m)
  * @returns {string[]} Unique array of H3 index strings forming the corridor
  */
-function buildH3Corridor(routePoints, resolution = DEFAULT_RES) {
+function buildH3Corridor(routePoints, opts = {}) {
+  const resolution = opts.resolution || DEFAULT_RES;
+  const buffer = opts.buffer != null ? opts.buffer : 1;
+
   if (!routePoints || routePoints.length === 0) return [];
 
-  // 1. Interpolate so no gap > ~50 m
   const dense = interpolateRoute(routePoints);
-
-  // 2 + 3. Convert to H3 cells and expand with k=1 ring, collecting into a Set
   const cellSet = new Set();
 
   for (let i = 0; i < dense.length; i++) {
     const center = h3.latLngToCell(dense[i].lat, dense[i].lng, resolution);
     if (!cellSet.has(center)) {
       cellSet.add(center);
-      // k-ring at k=1 gives the center cell + 6 neighbours
-      const ring = h3.gridDisk(center, 1);
+      const ring = h3.gridDisk(center, buffer);
       for (let j = 0; j < ring.length; j++) {
         cellSet.add(ring[j]);
       }
     }
   }
 
-  // 4 + 5. cellSet is already deduplicated — return as array
   return Array.from(cellSet);
 }
 

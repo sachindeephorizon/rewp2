@@ -132,4 +132,48 @@ router.get("/user/:id", async (req, res) => {
   }
 });
 
+// ── GET /session/:sessionId/deviations ──────────────────────────────
+
+router.get("/:sessionId/deviations", async (req, res) => {
+  try {
+    const sid = parseInt(req.params.sessionId, 10);
+    if (isNaN(sid)) {
+      return res.status(400).json({ error: "Invalid session id" });
+    }
+
+    const result = await pool.query(
+      `SELECT id, user_id, lat, lng, h3_cell, distance_from_route, zone, consecutive,
+              detected_at, destination_name, resolved_at
+       FROM deviations WHERE session_id = $1 ORDER BY detected_at ASC`,
+      [sid]
+    );
+
+    return res.status(200).json({ ok: true, data: result.rows });
+  } catch (err) {
+    console.error("[GET /session/:id/deviations] Error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ── GET /user/:id/deviations — all deviations for a user ───────────
+
+router.get("/user/:id/deviations", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+
+    const result = await pool.query(
+      `SELECT id, session_id, lat, lng, h3_cell, distance_from_route, zone, consecutive,
+              detected_at, destination_name, resolved_at
+       FROM deviations WHERE user_id = $1 ORDER BY detected_at DESC LIMIT $2`,
+      [id, limit]
+    );
+
+    return res.status(200).json({ ok: true, data: result.rows });
+  } catch (err) {
+    console.error("[GET /user/:id/deviations] Error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 module.exports = router;

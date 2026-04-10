@@ -101,6 +101,26 @@ async function connectDB() {
       -- "give me all logs for session X ordered by time"
       CREATE INDEX IF NOT EXISTS idx_location_logs_session_time
         ON location_logs(session_id, recorded_at ASC);
+
+      -- Deviation events: logged when a user leaves the outer corridor
+      CREATE TABLE IF NOT EXISTS deviations (
+        id            SERIAL PRIMARY KEY,
+        user_id       VARCHAR(100) NOT NULL,
+        session_id    INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+        lat           DOUBLE PRECISION NOT NULL,
+        lng           DOUBLE PRECISION NOT NULL,
+        h3_cell       VARCHAR(20),
+        distance_from_route DOUBLE PRECISION,
+        zone          VARCHAR(20) NOT NULL DEFAULT 'OUTSIDE',
+        consecutive   INTEGER NOT NULL DEFAULT 1,
+        detected_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        destination_name VARCHAR(255),
+        resolved_at   TIMESTAMPTZ
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_deviations_user_id ON deviations(user_id);
+      CREATE INDEX IF NOT EXISTS idx_deviations_session_id ON deviations(session_id);
+      CREATE INDEX IF NOT EXISTS idx_deviations_detected_at ON deviations(detected_at);
     `);
 
     client.release();

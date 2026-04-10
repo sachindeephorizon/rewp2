@@ -110,6 +110,18 @@ function initSocket(httpServer) {
   subscriber.subscribe(CHANNEL, (message) => {
     try {
       const data = JSON.parse(message);
+
+      if (data.event === "deviation_alert") {
+        // Deviation alerts go to stream rooms AND as a global event
+        if (data.roomNames) {
+          data.roomNames.forEach((room) => {
+            io.to(room).emit("deviation:alert", data);
+          });
+        }
+        io.emit("deviation:alert", data);
+        return;
+      }
+
       const eventName = data.stopped ? SOCKET_STOP_EVENT : SOCKET_STREAM_EVENT;
       emitToStreamRooms(data, eventName);
       emitGlobalThrottled(data);
