@@ -13,6 +13,7 @@ const {
 const { reverseGeocode } = require("../utils/geocode");
 const { rateLimitPing } = require("../utils/rateLimit");
 const { snapToRoad, snapTrajectory } = require("../utils/snapToRoad");
+const { latLngToH3Cell } = require("../utils/h3corridor");
 const {
   LOCATION_TTL,
   SESSION_TTL,
@@ -154,6 +155,9 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
     const finalLat = snapped.lat;
     const finalLng = snapped.lng;
 
+    // Compute H3 cell for this location (resolution 9, ~174m hex edge)
+    const h3Cell = latLngToH3Cell(finalLat, finalLng, 9);
+
     const now = new Date().toISOString();
     const redisKey = `user:${userId}`;
     const sessionStartKey = `session:${userId}:start`;
@@ -186,10 +190,12 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       finalLng,
       body: req.body,
     });
+    payload.h3Cell = h3Cell;
 
     const locationPoint = JSON.stringify({
       lat: finalLat,
       lng: finalLng,
+      h3Cell,
       timestamp: now,
       accuracy: payload.accuracy,
       speed: payload.speed,
@@ -259,12 +265,12 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
             const vals = [];
             const params = [];
             batch.forEach((point, index) => {
-              const offset = index * 4;
-              vals.push(`($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4})`);
-              params.push(oldSid, point.lat, point.lng, point.timestamp);
+              const offset = index * 5;
+              vals.push(`($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5})`);
+              params.push(oldSid, point.lat, point.lng, point.h3Cell || null, point.timestamp);
             });
             await pool.query(
-              `INSERT INTO location_logs (session_id, lat, lng, recorded_at) VALUES ${vals.join(",")}`,
+              `INSERT INTO location_logs (session_id, lat, lng, h3_cell, recorded_at) VALUES ${vals.join(",")}`,
               params
             );
           }
@@ -374,12 +380,12 @@ router.post("/:id/stop", async (req, res) => {
       const values = [];
       const params = [];
       batch.forEach((point, index) => {
-        const offset = index * 4;
-        values.push(`($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4})`);
-        params.push(dbSessionId, point.lat, point.lng, point.timestamp);
+        const offset = index * 5;
+        values.push(`($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5})`);
+        params.push(dbSessionId, point.lat, point.lng, point.h3Cell || null, point.timestamp);
       });
       await pool.query(
-        `INSERT INTO location_logs (session_id, lat, lng, recorded_at) VALUES ${values.join(",")}`,
+        `INSERT INTO location_logs (session_id, lat, lng, h3_cell, recorded_at) VALUES ${values.join(",")}`,
         params
       );
     }
@@ -416,6 +422,9 @@ router.post("/:id/stop", async (req, res) => {
       redis.del(sessionLogsKey),
       redis.del(trailKey),
       redis.del(startMarkerKey),
+      redis.del(`nav:dest:${userId}`),
+      redis.del(`nav:corridor:${userId}`),
+      redis.del(`nav:route:${userId}`),
       redis.sRem(ACTIVE_SET, userId),
       redis.publish(CHANNEL, JSON.stringify(stopPayload)),
     ]);

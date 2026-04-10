@@ -4,6 +4,7 @@ const authRoutes = require("./auth");
 const trackingRoutes = require("./tracking");
 const usersRoutes = require("./users");
 const sessionsRoutes = require("./sessions");
+const destinationRoutes = require("./destination");
 
 const router = Router();
 
@@ -20,5 +21,8 @@ router.use("/user", usersRoutes);
 // GET /sessions/all, GET /session/:id/logs, DELETE /session/:id, GET /sessions/user/:id
 router.use("/sessions", sessionsRoutes);
 router.use("/session", sessionsRoutes);
+
+// POST /destination/:id/set, POST /destination/:id/clear, GET /destination/:id, GET /destination/:id/remaining
+router.use("/destination", destinationRoutes);
 
 module.exports = router;

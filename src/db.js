@@ -82,11 +82,15 @@ async function connectDB() {
         session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
         lat         DOUBLE PRECISION NOT NULL,
         lng         DOUBLE PRECISION NOT NULL,
+        h3_cell     VARCHAR(20),
         recorded_at TIMESTAMPTZ NOT NULL
       );
 
+      ALTER TABLE location_logs ADD COLUMN IF NOT EXISTS h3_cell VARCHAR(20);
+
       CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
       CREATE INDEX IF NOT EXISTS idx_location_logs_session_id ON location_logs(session_id);
+      CREATE INDEX IF NOT EXISTS idx_location_logs_h3_cell ON location_logs(h3_cell);
 
       -- FIX: Add index on recorded_at for fast time-range queries on large sessions.
       -- A 10hr session at 1s pings = 36,000 rows. Without this index,
