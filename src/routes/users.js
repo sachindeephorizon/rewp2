@@ -175,4 +175,67 @@ router.get("/:id/session-distance", async (req, res) => {
   }
 });
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Force location request — agent asks the phone to send a fresh GPS fix.
+//
+// Flow:
+//   1. Agent calls  POST /user/:id/request-location
+//      → sets Redis key  locreq:${id}  with TTL 120s
+//      → returns last known location immediately (may be stale)
+//   2. Phone detects the request via:
+//      a) The ping response includes  forceRefresh: true  (see tracking.js)
+//      b) Phone polls  GET /user/:id/request-location  every 30s as fallback
+//   3. Phone grabs a fresh GPS fix and sends a ping with source "force_request"
+//   4. That ping clears the Redis key automatically (see tracking.js)
+// ──────────────────────────────────────────────────────────────────────────────
+const LOCREQ_TTL = 120; // seconds — auto-expire if phone never responds
+
+router.post("/:id/request-location", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id || typeof id !== "string") {
+      return res.status(400).json({ error: "Invalid user id" });
+    }
+
+    // Store the request flag.
+    await redis.set(`locreq:${id}`, JSON.stringify({
+      requestedAt: new Date().toISOString(),
+      requestedBy: req.body?.agentId || "unknown",
+    }), { EX: LOCREQ_TTL });
+
+    // Return last known location immediately so the agent has *something*.
+    const raw = await redis.get(`user:${id}`);
+    const lastKnown = raw ? JSON.parse(raw) : null;
+
+    return res.status(200).json({
+      ok: true,
+      pending: true,
+      message: "Location request sent. Phone will respond within ~30 seconds.",
+      lastKnown,
+    });
+  } catch (err) {
+    console.error("[POST /user/:id/request-location] Error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.get("/:id/request-location", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id || typeof id !== "string") {
+      return res.status(400).json({ error: "Invalid user id" });
+    }
+
+    const raw = await redis.get(`locreq:${id}`);
+    if (!raw) {
+      return res.status(200).json({ ok: true, pending: false });
+    }
+
+    return res.status(200).json({ ok: true, pending: true, ...JSON.parse(raw) });
+  } catch (err) {
+    console.error("[GET /user/:id/request-location] Error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 module.exports = router;

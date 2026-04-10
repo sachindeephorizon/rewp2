@@ -123,6 +123,9 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
         await saveUserState(userId);
       }
 
+      // Even on a filtered ping, tell the phone if an agent wants a fresh fix.
+      const pendingReq = await redis.get(`locreq:${userId}`);
+
       return res.status(200).json({
         ok: true,
         filtered: true,
@@ -131,6 +134,7 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
         streamKey: streamMeta.streamKey,
         rideChannel: streamMeta.rideChannel,
         sessionId: streamMeta.sessionId,
+        forceRefresh: !!pendingReq,
       });
     }
 
@@ -300,7 +304,19 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
 
     await Promise.all(redisOps);
 
-    return res.status(200).json({ ok: true, data: payload });
+    // Check for a pending force-location request from an agent.
+    // If the phone just responded to one (source === "force_request"), clear it.
+    const locReqKey = `locreq:${userId}`;
+    let forceRefresh = false;
+
+    if (req.body.source === "force_request") {
+      await redis.del(locReqKey);
+    } else {
+      const pending = await redis.get(locReqKey);
+      if (pending) forceRefresh = true;
+    }
+
+    return res.status(200).json({ ok: true, data: payload, forceRefresh });
   } catch (err) {
     console.error("[POST /:id/ping] Error:", err.message);
     return res.status(500).json({ error: "Internal server error" });
