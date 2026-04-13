@@ -10,20 +10,25 @@ const { buildH3Corridor } = require("../utils/h3corridor");
 const router = Router();
 
 // Redis key helpers
-const destKey = (userId) => `nav:dest:${userId}`;
-const corridorKey = (userId) => `nav:corridor:${userId}`;  // kept for dashboard viz
-const innerKey = (userId) => `nav:inner:${userId}`;         // Redis SET — O(1) lookups
-const outerKey = (userId) => `nav:outer:${userId}`;         // Redis SET — O(1) lookups
-const routeKey = (userId) => `nav:route:${userId}`;
+const destKey      = (userId) => `nav:dest:${userId}`;
+const corridorKey  = (userId) => `nav:corridor:${userId}`;  // dashboard viz only
+const innerKey     = (userId) => `nav:inner:${userId}`;      // SAFE zone  — O(1) sIsMember
+const outerKey     = (userId) => `nav:outer:${userId}`;      // BUFFER zone — O(1) sIsMember
+const routeKey     = (userId) => `nav:route:${userId}`;
 
 /**
  * POST /destination/:id/set
  *
- * Called by the phone when the user picks a destination.
- * 1. Fetches OSRM driving route from origin → destination
- * 2. Builds H3 corridor cells (res 9, k=1 ring ≈ 500m width)
- * 3. Stores destination, route, and corridor in Redis
- * 4. Returns distance + duration to the phone (no route/h3 details)
+ * Dual-corridor design (resolution 10, edge ≈ 65m):
+ *
+ *   INNER  buffer=1 → ~130m from route centre  → SAFE   (on route)
+ *   OUTER  buffer=2 → ~260m from route centre  → BUFFER (GPS noise)
+ *   Beyond outer                               → OUTSIDE → 3 consecutive = DEVIATED 🚨
+ *
+ * FIX (was buffer=1/2 but MAX_GAP_M=50 caused corridors to blob-merge,
+ * wiping out the OUTSIDE zone entirely).  The real fix is in h3corridor.js
+ * (MAX_GAP_M 50→30), but we also keep buffers explicitly documented here
+ * so they're easy to tune.
  */
 router.post("/:id/set", async (req, res) => {
   try {
@@ -34,7 +39,7 @@ router.post("/:id/set", async (req, res) => {
       return res.status(400).json({ error: "Invalid user id" });
     }
     if (
-      !origin || typeof origin.lat !== "number" || typeof origin.lng !== "number" ||
+      !origin      || typeof origin.lat      !== "number" || typeof origin.lng      !== "number" ||
       !destination || typeof destination.lat !== "number" || typeof destination.lng !== "number"
     ) {
       return res.status(400).json({ error: "origin and destination must have lat/lng numbers" });
@@ -43,16 +48,24 @@ router.post("/:id/set", async (req, res) => {
     // 1. Fetch OSRM route
     const { route, distance, duration } = await fetchOsrmRoute(origin, destination);
 
-    // 2. Build dual H3 corridors
-    //    Inner (k=1, ~150m) → safe zone
-    //    Outer (k=2, ~300m) → buffer / noise zone
-    //    Outside outer → deviation
-    // Resolution 10: ~65m edge. k=1 ≈ 130m inner, k=2 ≈ 200m outer.
-    // Resolution 9 was too coarse (~174m edge, corridors 700m+ wide in dense areas).
+    // 2. Build dual H3 corridors at resolution 10
+    //    Inner  (k=1) → ~130m  — SAFE zone, no deviation counter increment
+    //    Outer  (k=2) → ~260m  — BUFFER zone, ignore (GPS noise)
+    //    Outside both → OUTSIDE zone, 3 consecutive pings → deviation alert
+    //
+    //    NOTE: outerCells is a superset of innerCells by definition (k=2 ⊃ k=1).
+    //    The ping handler checks inner FIRST, then outer, so a cell that is in both
+    //    is correctly classified as SAFE, not BUFFER.
     const innerCells = buildH3Corridor(route, { resolution: 10, buffer: 1 });
     const outerCells = buildH3Corridor(route, { resolution: 10, buffer: 2 });
 
-    // 3. Store in Redis with session-level TTL
+    console.log(
+      `[destination] ${userId} → ${destination.lat.toFixed(4)},${destination.lng.toFixed(4)} | ` +
+      `${route.length} pts | inner=${innerCells.length} outer=${outerCells.length} h3 cells | ` +
+      `${(distance / 1000).toFixed(1)}km`
+    );
+
+    // 3. Store in Redis
     const destData = {
       origin,
       destination,
@@ -62,33 +75,26 @@ router.post("/:id/set", async (req, res) => {
       setAt: new Date().toISOString(),
     };
 
-    // Clear any previous corridor sets first
+    // Clear previous corridor sets first (avoids stale cells from old routes)
     await Promise.all([
       redis.del(innerKey(userId)),
       redis.del(outerKey(userId)),
     ]);
 
     await Promise.all([
-      redis.set(destKey(userId), JSON.stringify(destData), { EX: SESSION_TTL }),
-      redis.set(corridorKey(userId), JSON.stringify(outerCells), { EX: SESSION_TTL }), // for dashboard viz
-      redis.set(routeKey(userId), JSON.stringify(route), { EX: SESSION_TTL }),
-      // Store as Redis SETs for O(1) sIsMember lookups during ping deviation checks
+      redis.set(destKey(userId),     JSON.stringify(destData),   { EX: SESSION_TTL }),
+      redis.set(corridorKey(userId), JSON.stringify(outerCells), { EX: SESSION_TTL }), // dashboard viz
+      redis.set(routeKey(userId),    JSON.stringify(route),      { EX: SESSION_TTL }),
       innerCells.length > 0 ? redis.sAdd(innerKey(userId), innerCells) : Promise.resolve(),
       outerCells.length > 0 ? redis.sAdd(outerKey(userId), outerCells) : Promise.resolve(),
     ]);
 
-    // Set TTL on the sets
     await Promise.all([
       redis.expire(innerKey(userId), SESSION_TTL),
       redis.expire(outerKey(userId), SESSION_TTL),
     ]);
 
-    console.log(
-      `[destination] ${userId} → ${destination.lat.toFixed(4)},${destination.lng.toFixed(4)} | ` +
-      `${route.length} pts | inner=${innerCells.length} outer=${outerCells.length} h3 cells | ${(distance / 1000).toFixed(1)}km`
-    );
-
-    // 4. Return only what the phone needs — distance + duration
+    // 4. Return only what the phone needs
     return res.status(200).json({
       ok: true,
       distance,
@@ -103,8 +109,6 @@ router.post("/:id/set", async (req, res) => {
 
 /**
  * POST /destination/:id/clear
- *
- * Called when the user clears their destination or arrives.
  */
 router.post("/:id/clear", async (req, res) => {
   try {
@@ -125,9 +129,6 @@ router.post("/:id/clear", async (req, res) => {
 
 /**
  * GET /destination/:id
- *
- * Returns current destination info + remaining distance.
- * Called by the phone to check distance-left, and by the dashboard to show the route.
  */
 router.get("/:id", async (req, res) => {
   try {
@@ -139,23 +140,22 @@ router.get("/:id", async (req, res) => {
 
     const dest = JSON.parse(raw);
 
-    // Dashboard can request the full route and/or H3 corridor for display
     let route = null;
     let corridor = null;
+
     if (req.query.includeRoute === "true") {
       const routeRaw = await redis.get(routeKey(userId));
       if (routeRaw) route = JSON.parse(routeRaw);
     }
+
     if (req.query.includeCorridor === "true") {
       const corridorRaw = await redis.get(corridorKey(userId));
       if (corridorRaw) {
         const cells = JSON.parse(corridorRaw);
-        // Convert H3 indices to GeoJSON FeatureCollection so the dashboard
-        // doesn't need h3-js (WASM issues in Next.js).
         const features = cells.map((cellIndex) => {
-          const boundary = h3.cellToBoundary(cellIndex); // [[lat,lng], ...]
+          const boundary = h3.cellToBoundary(cellIndex);
           const ring = boundary.map(([lat, lng]) => [lng, lat]);
-          ring.push(ring[0]); // close the ring
+          ring.push(ring[0]);
           return {
             type: "Feature",
             properties: { h3: cellIndex },
@@ -185,9 +185,6 @@ router.get("/:id", async (req, res) => {
 
 /**
  * GET /destination/:id/remaining
- *
- * Computes distance remaining from user's current location to destination
- * using the stored route + their latest ping position.
  */
 router.get("/:id/remaining", async (req, res) => {
   try {
@@ -203,7 +200,7 @@ router.get("/:id/remaining", async (req, res) => {
     }
 
     const dest = JSON.parse(destRaw);
-    const loc = locRaw ? JSON.parse(locRaw) : null;
+    const loc  = locRaw ? JSON.parse(locRaw) : null;
 
     if (!loc || !routeRaw) {
       return res.status(200).json({
@@ -215,7 +212,6 @@ router.get("/:id/remaining", async (req, res) => {
       });
     }
 
-    // Simple remaining calc: sum haversine from nearest route point onward
     const route = JSON.parse(routeRaw);
     const { haversineDistance } = require("../utils/gps");
 
@@ -227,7 +223,10 @@ router.get("/:id/remaining", async (req, res) => {
 
     let remaining = 0;
     for (let i = minIdx; i < route.length - 1; i++) {
-      remaining += haversineDistance(route[i].lat, route[i].lng, route[i + 1].lat, route[i + 1].lng);
+      remaining += haversineDistance(
+        route[i].lat, route[i].lng,
+        route[i + 1].lat, route[i + 1].lng
+      );
     }
 
     return res.status(200).json({

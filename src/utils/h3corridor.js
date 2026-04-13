@@ -4,7 +4,12 @@ const h3 = require('h3-js');
 
 const DEFAULT_RES = 9;
 const EARTH_RADIUS_M = 6_371_000;
-const MAX_GAP_M = 50; // interpolate if consecutive points are farther apart
+
+// FIX: was 50m — caused massive corridor blob overlap because dense interpolation
+// + k=2 gridDisk rings merged into one giant zone, leaving no OUTSIDE zone at all.
+// Resolution 10 edge ≈ 65m, so 30m is tight enough to prevent cell gaps while
+// keeping the corridor set lean.
+const MAX_GAP_M = 30;
 
 // ─── Haversine distance (metres) ────────────────────────────────────────────
 
@@ -47,7 +52,6 @@ function interpolateRoute(routePoints, maxGap = MAX_GAP_M) {
     const seg = interpolateSegment(routePoints[i], routePoints[i + 1], maxGap);
     for (let j = 0; j < seg.length; j++) out.push(seg[j]);
   }
-  // always include the last point
   out.push(routePoints[routePoints.length - 1]);
   return out;
 }
@@ -56,10 +60,6 @@ function interpolateRoute(routePoints, maxGap = MAX_GAP_M) {
 
 /**
  * Convert a single lat/lng to its H3 cell index.
- * @param {number} lat
- * @param {number} lng
- * @param {number} [resolution=9]
- * @returns {string} H3 index
  */
 function latLngToH3Cell(lat, lng, resolution = DEFAULT_RES) {
   return h3.latLngToCell(lat, lng, resolution);
@@ -68,11 +68,16 @@ function latLngToH3Cell(lat, lng, resolution = DEFAULT_RES) {
 /**
  * Build an H3 corridor from an OSRM-decoded route.
  *
+ * Resolution 10, edge ≈ 65m:
+ *   buffer=1 → ~130m safe zone  (INNER)
+ *   buffer=2 → ~260m buffer zone (OUTER)
+ *   beyond   → OUTSIDE — triggers deviation after 3 consecutive pings
+ *
  * @param {Array<{lat: number, lng: number}>} routePoints
  * @param {object} [opts]
- * @param {number} [opts.resolution=9]  H3 resolution (default 9, ~174 m edge)
- * @param {number} [opts.buffer=1]      gridDisk k-ring radius (1 ≈ 150m, 2 ≈ 300m)
- * @returns {string[]} Unique array of H3 index strings forming the corridor
+ * @param {number} [opts.resolution=9]
+ * @param {number} [opts.buffer=1]
+ * @returns {string[]} Unique array of H3 index strings
  */
 function buildH3Corridor(routePoints, opts = {}) {
   const resolution = opts.resolution || DEFAULT_RES;
@@ -99,10 +104,6 @@ function buildH3Corridor(routePoints, opts = {}) {
 
 /**
  * Check whether an H3 index falls inside a pre-built corridor.
- *
- * @param {string} h3Index
- * @param {Set<string>} corridorSet  A Set created from buildH3Corridor output
- * @returns {boolean}
  */
 function isInCorridor(h3Index, corridorSet) {
   return corridorSet.has(h3Index);
