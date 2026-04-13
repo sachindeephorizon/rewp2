@@ -47,8 +47,10 @@ router.post("/:id/set", async (req, res) => {
     //    Inner (k=1, ~150m) → safe zone
     //    Outer (k=2, ~300m) → buffer / noise zone
     //    Outside outer → deviation
-    const innerCells = buildH3Corridor(route, { resolution: 9, buffer: 1 });
-    const outerCells = buildH3Corridor(route, { resolution: 9, buffer: 2 });
+    // Resolution 10: ~65m edge. k=1 ≈ 130m inner, k=2 ≈ 200m outer.
+    // Resolution 9 was too coarse (~174m edge, corridors 700m+ wide in dense areas).
+    const innerCells = buildH3Corridor(route, { resolution: 10, buffer: 1 });
+    const outerCells = buildH3Corridor(route, { resolution: 10, buffer: 2 });
 
     // 3. Store in Redis with session-level TTL
     const destData = {

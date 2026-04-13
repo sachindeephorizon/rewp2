@@ -159,7 +159,7 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
 
         // Deviation check (dual corridor)
         if (!filteredArrival) {
-          const devCell = latLngToH3Cell(lat, lng, 9);
+          const devCell = latLngToH3Cell(lat, lng, 10);
           const inInner = await redis.sIsMember(`nav:inner:${userId}`, devCell);
           const inOuter = await redis.sIsMember(`nav:outer:${userId}`, devCell);
 
@@ -450,10 +450,9 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       // OUTER (k=2, ~300m) → BUFFER (GPS noise, ignore)
       // OUTSIDE (>300m) → 3 consecutive → DEVIATED 🚨
       if (!arrivalDetected) {
-        const rawDevCell = latLngToH3Cell(rawLat, rawLng, 9);
+        const rawDevCell = latLngToH3Cell(rawLat, rawLng, 10);
         const inInner = await redis.sIsMember(`nav:inner:${userId}`, rawDevCell);
         const inOuter = await redis.sIsMember(`nav:outer:${userId}`, rawDevCell);
-
         let zone;
         if (inInner) {
           zone = "SAFE";
