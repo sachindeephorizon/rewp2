@@ -48,16 +48,19 @@ router.post("/:id/set", async (req, res) => {
     // 1. Fetch OSRM route
     const { route, distance, duration } = await fetchOsrmRoute(origin, destination);
 
-    // 2. Build dual H3 corridors at resolution 10
-    //    Inner  (k=1) → ~130m  — SAFE zone, no deviation counter increment
-    //    Outer  (k=2) → ~260m  — BUFFER zone, ignore (GPS noise)
-    //    Outside both → OUTSIDE zone, 3 consecutive pings → deviation alert
+    // 2. Build dual H3 corridors at resolution 10 (cell edge ≈ 65m)
     //
-    //    NOTE: outerCells is a superset of innerCells by definition (k=2 ⊃ k=1).
-    //    The ping handler checks inner FIRST, then outer, so a cell that is in both
-    //    is correctly classified as SAFE, not BUFFER.
-    const innerCells = buildH3Corridor(route, { resolution: 10, buffer: 1 });
-    const outerCells = buildH3Corridor(route, { resolution: 10, buffer: 2 });
+    //    INNER  buffer=0 → ~65m  — just the route cells, SAFE zone
+    //    OUTER  buffer=1 → ~130m — one ring out, BUFFER zone (GPS noise)
+    //    OUTSIDE both    → >~130m from route → 3 consecutive pings = DEVIATED 🚨
+    //
+    //    Why reduced from buffer=1/2?
+    //    Debug confirmed: at 250m off-route the point was still inOuter=true
+    //    with buffer=2 (~260m coverage), leaving no OUTSIDE zone until 300m+.
+    //    buffer=0/1 gives a real OUTSIDE zone from ~130m onward, well within
+    //    the 300m alert requirement.
+    const innerCells = buildH3Corridor(route, { resolution: 10, buffer: 0 });
+    const outerCells = buildH3Corridor(route, { resolution: 10, buffer: 1 });
 
     console.log(
       `[destination] ${userId} → ${destination.lat.toFixed(4)},${destination.lng.toFixed(4)} | ` +
@@ -239,92 +242,6 @@ router.get("/:id/remaining", async (req, res) => {
   } catch (err) {
     console.error("[GET /destination/:id/remaining] Error:", err.message);
     return res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-
-/**
- * GET /destination/:id/debug-corridor?lat=XX&lng=YY
- *
- * Temporary debug endpoint — remove after fixing deviation.
- * Shows exactly what zone a coordinate falls in and current streak.
- *
- * Example:
- * https://rewp2-production.up.railway.app/destination/sim-driver-1/debug-corridor?lat=26.11978&lng=91.71447
- */
-router.get("/:id/debug-corridor", async (req, res) => {
-  try {
-    const userId = req.params.id;
-    const lat = parseFloat(req.query.lat);
-    const lng = parseFloat(req.query.lng);
-
-    if (isNaN(lat) || isNaN(lng)) {
-      return res.status(400).json({ error: "lat and lng query params required" });
-    }
-
-    const h3 = require("h3-js");
-
-    // Check at resolution 10 (what corridor is built at)
-    const cell10 = h3.latLngToCell(lat, lng, 10);
-    // Also check res 9 (old code used this in payload)
-    const cell9  = h3.latLngToCell(lat, lng, 9);
-
-    const [
-      innerCount,
-      outerCount,
-      inInner10,
-      inOuter10,
-      inInner9,
-      inOuter9,
-      streakRaw,
-      destRaw,
-    ] = await Promise.all([
-      redis.sCard(`nav:inner:${userId}`),
-      redis.sCard(`nav:outer:${userId}`),
-      redis.sIsMember(`nav:inner:${userId}`, cell10),
-      redis.sIsMember(`nav:outer:${userId}`, cell10),
-      redis.sIsMember(`nav:inner:${userId}`, cell9),
-      redis.sIsMember(`nav:outer:${userId}`, cell9),
-      redis.get(`devstreak:${userId}`),
-      redis.get(`nav:dest:${userId}`),
-    ]);
-
-    const verdict10 = inInner10 ? "SAFE" : inOuter10 ? "BUFFER" : "OUTSIDE ✅ (should trigger deviation)";
-    const verdict9  = inInner9  ? "SAFE" : inOuter9  ? "BUFFER" : "OUTSIDE";
-
-    return res.json({
-      queried: { lat, lng },
-      corridor: {
-        innerCellCount: innerCount,
-        outerCellCount: outerCount,
-        // If outer count is > 5000, corridor is probably still bloated from old code
-        likelyBloated: outerCount > 5000,
-      },
-      resolution10: {
-        cell: cell10,
-        inInner: inInner10,
-        inOuter: inOuter10,
-        verdict: verdict10,
-      },
-      resolution9: {
-        cell: cell9,
-        inInner: inInner9,
-        inOuter: inOuter9,
-        verdict: verdict9,
-      },
-      deviationStreak: streakRaw ? JSON.parse(streakRaw) : { count: 0 },
-      destinationActive: !!destRaw,
-      diagnosis: innerCount === 0
-        ? "❌ NO CORRIDOR IN REDIS — run /destination/:id/set first"
-        : outerCount > 5000
-          ? "❌ CORRIDOR BLOATED — old h3corridor.js still deployed, clear Redis and redeploy"
-          : inOuter10
-            ? "❌ POINT INSIDE OUTER CORRIDOR — corridor still too wide, or point not far enough"
-            : "✅ POINT IS OUTSIDE — deviation should be firing, check devstreak increment",
-    });
-  } catch (err) {
-    console.error("[debug-corridor]", err.message);
-    return res.status(500).json({ error: err.message });
   }
 });
 
