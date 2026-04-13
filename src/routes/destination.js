@@ -2,8 +2,9 @@
 
 const { Router } = require("express");
 const { redis } = require("../redis");
-const { SESSION_TTL } = require("../config");
+const { SESSION_TTL, CHANNEL } = require("../config");
 const { fetchOsrmRoute } = require("../utils/osrmRoute");
+const { pool } = require("../db");
 const h3 = require("h3-js");
 const { buildH3Corridor } = require("../utils/h3corridor");
 
@@ -68,13 +69,18 @@ router.post("/:id/set", async (req, res) => {
       `${(distance / 1000).toFixed(1)}km`
     );
 
-    // 3. Store in Redis
+    // 3. Store in Redis — destData includes everything needed to persist
+    // to PostgreSQL sessions table on stop
+    const corridorCellIds = outerCells; // H3 cell index strings
     const destData = {
       origin,
       destination,
       name: req.body.name || null,
       distance,
       duration,
+      routePointCount: route.length,
+      innerCellCount: innerCells.length,
+      outerCellCount: outerCells.length,
       setAt: new Date().toISOString(),
     };
 
@@ -97,7 +103,23 @@ router.post("/:id/set", async (req, res) => {
       redis.expire(outerKey(userId), SESSION_TTL),
     ]);
 
-    // 4. Return only what the phone needs
+    // 4. Log destination_set event to session_events (best-effort)
+    pool.query(
+      `INSERT INTO session_events (user_id, event_type, lat, lng, metadata)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [userId, 'destination_set', destination.lat, destination.lng, JSON.stringify({
+        name: req.body.name || null,
+        origin,
+        destination,
+        distance,
+        duration,
+        routePoints: route.length,
+        innerCells: innerCells.length,
+        outerCells: outerCells.length,
+      })]
+    ).catch((e) => console.error("[destination_set] event log failed:", e.message));
+
+    // 5. Return only what the phone needs
     return res.status(200).json({
       ok: true,
       distance,
@@ -123,6 +145,10 @@ router.post("/:id/clear", async (req, res) => {
       redis.del(outerKey(userId)),
       redis.del(routeKey(userId)),
     ]);
+    pool.query(
+      `INSERT INTO session_events (user_id, event_type) VALUES ($1, $2)`,
+      [userId, 'destination_cleared']
+    ).catch(() => {});
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("[POST /destination/:id/clear] Error:", err.message);

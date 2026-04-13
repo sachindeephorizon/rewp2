@@ -120,6 +120,10 @@ async function checkDeviation(userId, lat, lng, streamMeta, destData) {
         `UPDATE deviations SET resolved_at = NOW() WHERE user_id = $1 AND resolved_at IS NULL`,
         [userId]
       ).catch(() => {});
+      pool.query(
+        `INSERT INTO session_events (user_id, event_type, lat, lng) VALUES ($1, $2, $3, $4)`,
+        [userId, 'deviation_cleared', lat, lng]
+      ).catch(() => {});
     }
     return null; // no alert
   }
@@ -163,6 +167,13 @@ async function checkDeviation(userId, lat, lng, streamMeta, destData) {
       [userId, lat, lng, devCell, "OUTSIDE", newCount, destData.name || null]
     ).catch((e) => console.error("[deviation] DB insert failed:", e.message));
 
+    // Audit trail
+    pool.query(
+      `INSERT INTO session_events (user_id, event_type, lat, lng, h3_cell, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [userId, 'deviation_detected', lat, lng, devCell, JSON.stringify({ zone: 'OUTSIDE', consecutive: newCount, destinationName: destData.name })]
+    ).catch(() => {});
+
     console.log(`[deviation] 🚨 ${userId} alert fired | streak=${newCount}`);
     return alert;
   }
@@ -180,6 +191,13 @@ async function checkArrival(userId, lat, lng, destData, streamMeta, now) {
   if (distToDest >= ARRIVAL_RADIUS_M) return false;
 
   console.log(`[arrival] ✅ ${userId} arrived (${Math.round(distToDest)}m from dest)`);
+
+  // Audit trail
+  pool.query(
+    `INSERT INTO session_events (user_id, event_type, lat, lng, metadata)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [userId, 'arrival_detected', lat, lng, JSON.stringify({ distanceToDest: Math.round(distToDest), destinationName: destData.name })]
+  ).catch(() => {});
 
   await Promise.all([
     redis.del(`nav:dest:${userId}`),
@@ -425,12 +443,13 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
             const vals   = [];
             const params = [];
             batch.forEach((point, index) => {
-              const offset = index * 5;
-              vals.push(`($${offset+1},$${offset+2},$${offset+3},$${offset+4},$${offset+5})`);
-              params.push(oldSid, point.lat, point.lng, point.h3Cell || null, point.timestamp);
+              const offset = index * 7;
+              vals.push(`($${offset+1},$${offset+2},$${offset+3},$${offset+4},$${offset+5},$${offset+6},$${offset+7})`);
+              const speedKmh = typeof point.speed === 'number' ? point.speed * 3.6 : null;
+              params.push(oldSid, point.lat, point.lng, point.h3Cell || null, speedKmh, point.accuracy || null, point.timestamp);
             });
             await pool.query(
-              `INSERT INTO location_logs (session_id, lat, lng, h3_cell, recorded_at) VALUES ${vals.join(",")}`,
+              `INSERT INTO location_logs (session_id, lat, lng, h3_cell, speed_kmh, accuracy_m, recorded_at) VALUES ${vals.join(",")}`,
               params
             );
           }
@@ -455,6 +474,13 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       });
       redisOps.push(redis.set(startMarkerKey, startMarker));
       redisOps.push(redis.expire(startMarkerKey, SESSION_TTL));
+
+      // Audit: session_started
+      pool.query(
+        `INSERT INTO session_events (user_id, event_type, lat, lng, metadata)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [userId, 'session_started', finalLat, finalLng, JSON.stringify({ sessionId: streamMeta.sessionId, source: payload.source })]
+      ).catch(() => {});
     } else {
       redisOps.push(redis.rPush(sessionLogsKey, locationPoint));
       redisOps.push(redis.expire(sessionLogsKey, SESSION_TTL));
@@ -512,6 +538,12 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
             if (stationarySecs >= INACTIVITY_THRESHOLD_S && distToDest > ARRIVAL_RADIUS_M * 2) {
               inactivityFlag = true;
               console.log(`[inactivity] ⚠️ ${userId} stationary ${Math.round(stationarySecs)}s`);
+
+              pool.query(
+                `INSERT INTO session_events (user_id, event_type, lat, lng, metadata)
+                 VALUES ($1, $2, $3, $4, $5)`,
+                [userId, 'inactivity_detected', finalLat, finalLng, JSON.stringify({ stationarySecs: Math.round(stationarySecs), since: inactData.since })]
+              ).catch(() => {});
 
               await redis.publish(CHANNEL, JSON.stringify({
                 event: "inactivity_alert",
@@ -599,10 +631,39 @@ router.post("/:id/stop", async (req, res) => {
       lastLog  ? reverseGeocode(lastLog.lat,  lastLog.lng)  : null,
     ]);
 
+    // Read destination/route data from Redis before it gets deleted
+    const [destRaw, routeRaw, corridorRaw] = await Promise.all([
+      redis.get(`nav:dest:${userId}`),
+      redis.get(`nav:route:${userId}`),
+      redis.get(`nav:corridor:${userId}`),
+    ]);
+    const destInfo = destRaw ? JSON.parse(destRaw) : null;
+
+    // Count deviations for this session
+    const devCountRes = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM deviations WHERE user_id = $1 AND resolved_at IS NULL OR user_id = $1`,
+      [userId]
+    ).catch(() => ({ rows: [{ cnt: 0 }] }));
+
     const sessionResult = await pool.query(
-      `INSERT INTO sessions (user_id, session_name, started_at, ended_at, duration_secs, total_pings, start_location, end_location)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
-      [userId, sessionName, sessionStart, now, durationSecs, parsedLogs.length, startLocation, endLocation]
+      `INSERT INTO sessions (
+        user_id, session_name, status, started_at, ended_at, duration_secs, total_pings,
+        start_location, end_location,
+        origin_lat, origin_lng, dest_lat, dest_lng, dest_label,
+        route_polyline, route_h3_corridor, deviation_count
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id`,
+      [
+        userId, sessionName, 'completed', sessionStart, now, durationSecs, parsedLogs.length,
+        startLocation, endLocation,
+        destInfo?.origin?.lat || firstLog?.lat || null,
+        destInfo?.origin?.lng || firstLog?.lng || null,
+        destInfo?.destination?.lat || null,
+        destInfo?.destination?.lng || null,
+        destInfo?.name || null,
+        routeRaw || null,           // JSON string of route polyline [{lat,lng},...]
+        corridorRaw || null,        // JSON string of H3 corridor cell array
+        parseInt(devCountRes.rows[0].cnt, 10) || 0,
+      ]
     );
     const dbSessionId = sessionResult.rows[0].id;
 
@@ -612,17 +673,26 @@ router.post("/:id/stop", async (req, res) => {
       const values = [];
       const params = [];
       batch.forEach((point, index) => {
-        const offset = index * 5;
-        values.push(`($${offset+1},$${offset+2},$${offset+3},$${offset+4},$${offset+5})`);
-        params.push(dbSessionId, point.lat, point.lng, point.h3Cell || null, point.timestamp);
+        const offset = index * 7;
+        values.push(`($${offset+1},$${offset+2},$${offset+3},$${offset+4},$${offset+5},$${offset+6},$${offset+7})`);
+        const speedKmh = typeof point.speed === 'number' ? point.speed * 3.6 : null;
+        params.push(dbSessionId, point.lat, point.lng, point.h3Cell || null, speedKmh, point.accuracy || null, point.timestamp);
       });
       await pool.query(
-        `INSERT INTO location_logs (session_id, lat, lng, h3_cell, recorded_at) VALUES ${values.join(",")}`,
+        `INSERT INTO location_logs (session_id, lat, lng, h3_cell, speed_kmh, accuracy_m, recorded_at) VALUES ${values.join(",")}`,
         params
       );
     }
 
     console.log(`[stop] ${sessionName} | ${parsedLogs.length} pts | ${durationSecs}s`);
+
+    // Audit: session_ended
+    const lastPt = parsedLogs[parsedLogs.length - 1];
+    pool.query(
+      `INSERT INTO session_events (session_id, user_id, event_type, lat, lng, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [dbSessionId, userId, 'session_ended', lastPt?.lat, lastPt?.lng, JSON.stringify({ durationSecs, totalPings: parsedLogs.length, sessionName })]
+    ).catch(() => {});
 
     clearUserState(userId);
 
