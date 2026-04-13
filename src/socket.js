@@ -111,14 +111,19 @@ function initSocket(httpServer) {
     try {
       const data = JSON.parse(message);
 
-      if (data.event === "deviation_alert") {
-        // Deviation alerts go to stream rooms AND as a global event
+      if (data.event === "deviation_alert" || data.event === "inactivity_alert" || data.event === "arrival_detected") {
+        const eventMap = {
+          deviation_alert: "deviation:alert",
+          inactivity_alert: "inactivity:alert",
+          arrival_detected: "arrival:detected",
+        };
+        const socketEvent = eventMap[data.event];
         if (data.roomNames) {
           data.roomNames.forEach((room) => {
-            io.to(room).emit("deviation:alert", data);
+            io.to(room).emit(socketEvent, data);
           });
         }
-        io.emit("deviation:alert", data);
+        io.emit(socketEvent, data);
         return;
       }
 

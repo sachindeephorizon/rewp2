@@ -128,7 +128,75 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
         await saveUserState(userId);
       }
 
-      // Even on a filtered ping, tell the phone if an agent wants a fresh fix.
+      // Even on a filtered ping, run safety checks using RAW coordinates.
+      // Safety > tracking smoothness. The Kalman filter exists for tracking
+      // quality, but deviation/arrival/inactivity must check every ping.
+      let filteredDevAlert = null;
+      let filteredArrival = false;
+
+      const filteredDestRaw = await redis.get(`nav:dest:${userId}`);
+      if (filteredDestRaw) {
+        const fd = JSON.parse(filteredDestRaw);
+
+        // Arrival check
+        const dToDest = haversineDistance(lat, lng, fd.destination.lat, fd.destination.lng);
+        if (dToDest < 200) {
+          filteredArrival = true;
+          await Promise.all([
+            redis.del(`nav:dest:${userId}`), redis.del(`nav:corridor:${userId}`),
+            redis.del(`nav:inner:${userId}`), redis.del(`nav:outer:${userId}`),
+            redis.del(`nav:route:${userId}`), redis.del(`deviation:${userId}`),
+            redis.del(`inactivity:${userId}`),
+          ]);
+          deviationState.delete(userId);
+          await redis.publish(CHANNEL, JSON.stringify({
+            event: "arrival_detected", userId, lat, lng,
+            distanceToDest: Math.round(dToDest), destinationName: fd.name || null,
+            timestamp: new Date().toISOString(),
+            roomNames: streamMeta.roomNames, streamKey: streamMeta.streamKey,
+          }));
+        }
+
+        // Deviation check (dual corridor)
+        if (!filteredArrival) {
+          const devCell = latLngToH3Cell(lat, lng, 9);
+          const inInner = await redis.sIsMember(`nav:inner:${userId}`, devCell);
+          const inOuter = await redis.sIsMember(`nav:outer:${userId}`, devCell);
+
+          if (inInner) {
+            deviationState.set(userId, { count: 0 });
+            const ad = await redis.get(`deviation:${userId}`);
+            if (ad) {
+              await redis.del(`deviation:${userId}`);
+              pool.query(`UPDATE deviations SET resolved_at = NOW() WHERE user_id = $1 AND resolved_at IS NULL`, [userId]).catch(() => {});
+            }
+          } else if (!inOuter) {
+            // OUTSIDE — increment streak
+            const s = deviationState.get(userId) || { count: 0 };
+            s.count++;
+            deviationState.set(userId, s);
+            if (s.count >= 3) {
+              filteredDevAlert = {
+                userId, lat, lng, h3Cell: devCell, zone: "OUTSIDE",
+                consecutive: s.count, destinationName: fd.name || null,
+                detectedAt: new Date().toISOString(),
+              };
+              await redis.set(`deviation:${userId}`, JSON.stringify(filteredDevAlert), { EX: 86400 });
+              await redis.publish(CHANNEL, JSON.stringify({
+                event: "deviation_alert", ...filteredDevAlert,
+                roomNames: streamMeta.roomNames, streamKey: streamMeta.streamKey,
+              }));
+              pool.query(
+                `INSERT INTO deviations (user_id, lat, lng, h3_cell, zone, consecutive, destination_name) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+                [userId, lat, lng, devCell, 'OUTSIDE', s.count, fd.name || null]
+              ).catch(() => {});
+              console.log(`[deviation] 🚨 ${userId} (filtered ping) OUTSIDE | streak=${s.count}`);
+            }
+          }
+          // BUFFER → do nothing
+        }
+      }
+
       const pendingReq = await redis.get(`locreq:${userId}`);
 
       return res.status(200).json({
@@ -140,6 +208,8 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
         rideChannel: streamMeta.rideChannel,
         sessionId: streamMeta.sessionId,
         forceRefresh: !!pendingReq,
+        deviationAlert: filteredDevAlert,
+        arrivalDetected: filteredArrival,
       });
     }
 
@@ -283,7 +353,6 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       } catch (e) {
         console.error("[ping] Failed to save orphan session:", e.message);
       }
-
       redisOps.push(redis.del(sessionLogsKey));
       redisOps.push(redis.del(trailKey));
       redisOps.push(redis.set(sessionStartKey, now));
@@ -314,110 +383,179 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
 
     await Promise.all(redisOps);
 
-    // ── Deviation detection ─────────────────────────────────────────
-    // Only runs when the user has an active destination with corridors.
-    // Zone logic:
-    //   inner (k=1, ~150m) → SAFE
-    //   outer (k=2, ~300m) but not inner → BUFFER (GPS noise, ignore)
-    //   outside outer → OUTSIDE → if 3 consecutive → DEVIATED 🚨
+    // ── Navigation intelligence (deviation + arrival + inactivity) ──
+    // Two-step deviation detection per the engineering doc:
+    //   Step 1: H3 corridor (k=1, ~300m) as cheap pre-filter — microseconds
+    //   Step 2: Haversine min-distance to route polyline — precise confirm
+    //   Threshold: 150m for 3 consecutive pings → DEVIATED
+    //
+    // Arrival: haversine to destination <200m → arrived, end session
+    // Inactivity: stationary >15min outside destination zone → flag
+    // ─────────────────────────────────────────────────────────────────
+    const ARRIVAL_RADIUS_M = 200;
+    const INACTIVITY_THRESHOLD_S = 900; // 15 minutes
+
     let deviationAlert = null;
+    let arrivalDetected = false;
+    let inactivityFlag = false;
 
-    const hasDestination = await redis.exists(`nav:dest:${userId}`);
-    if (hasDestination) {
-      const inInner = await redis.sIsMember(`nav:inner:${userId}`, h3Cell);
+    const destRaw = await redis.get(`nav:dest:${userId}`);
+    if (destRaw) {
+      const destData = JSON.parse(destRaw);
 
-      if (inInner) {
-        // Safe — reset streak
-        deviationState.set(userId, { count: 0 });
-        // If there was an active deviation, mark it resolved
-        const activeDevKey = `deviation:${userId}`;
-        const activeDev = await redis.get(activeDevKey);
-        if (activeDev) {
-          await redis.del(activeDevKey);
-          // Resolve in DB (best-effort)
-          pool.query(
-            `UPDATE deviations SET resolved_at = NOW() WHERE user_id = $1 AND resolved_at IS NULL`,
-            [userId]
-          ).catch(() => {});
-        }
-      } else {
-        const inOuter = await redis.sIsMember(`nav:outer:${userId}`, h3Cell);
+      // ── Arrival detection ──────────────────────────────────────
+      // Use RAW GPS coordinates for safety checks (arrival, deviation).
+      // The Kalman filter smooths coordinates toward previous positions,
+      // which masks real deviation. Safety > smoothness.
+      const rawLat = lat;
+      const rawLng = lng;
 
-        if (inOuter) {
-          // Buffer zone — don't increment, don't reset (hysteresis)
-          // This absorbs GPS noise at corridor edges
+      const distToDest = haversineDistance(
+        rawLat, rawLng,
+        destData.destination.lat, destData.destination.lng
+      );
+
+      if (distToDest < ARRIVAL_RADIUS_M) {
+        arrivalDetected = true;
+        console.log(`[arrival] ✅ ${userId} arrived (${Math.round(distToDest)}m from dest)`);
+
+        // Clear destination + corridor + deviation state
+        await Promise.all([
+          redis.del(`nav:dest:${userId}`),
+          redis.del(`nav:corridor:${userId}`),
+          redis.del(`nav:inner:${userId}`),
+          redis.del(`nav:outer:${userId}`),
+          redis.del(`nav:route:${userId}`),
+          redis.del(`deviation:${userId}`),
+          redis.del(`inactivity:${userId}`),
+        ]);
+        deviationState.delete(userId);
+
+        // Publish arrival event
+        await redis.publish(CHANNEL, JSON.stringify({
+          event: "arrival_detected",
+          userId,
+          lat: finalLat,
+          lng: finalLng,
+          distanceToDest: Math.round(distToDest),
+          destinationName: destData.name || null,
+          timestamp: now,
+          roomNames: streamMeta.roomNames,
+          streamKey: streamMeta.streamKey,
+        }));
+      }
+
+      // ── Deviation detection (only if not arrived) ──────────────
+      // INNER (k=1, ~150m) → SAFE
+      // OUTER (k=2, ~300m) → BUFFER (GPS noise, ignore)
+      // OUTSIDE (>300m) → 3 consecutive → DEVIATED 🚨
+      if (!arrivalDetected) {
+        const rawDevCell = latLngToH3Cell(rawLat, rawLng, 9);
+        const inInner = await redis.sIsMember(`nav:inner:${userId}`, rawDevCell);
+        const inOuter = await redis.sIsMember(`nav:outer:${userId}`, rawDevCell);
+
+        let zone;
+        if (inInner) {
+          zone = "SAFE";
+        } else if (inOuter) {
+          zone = "BUFFER";
         } else {
-          // OUTSIDE — increment streak
+          zone = "OUTSIDE";
+        }
+
+        if (zone === "SAFE") {
+          deviationState.set(userId, { count: 0 });
+          // Resolve any active deviation
+          const activeDev = await redis.get(`deviation:${userId}`);
+          if (activeDev) {
+            await redis.del(`deviation:${userId}`);
+            pool.query(
+              `UPDATE deviations SET resolved_at = NOW() WHERE user_id = $1 AND resolved_at IS NULL`,
+              [userId]
+            ).catch(() => {});
+          }
+        } else if (zone === "BUFFER") {
+          // Noise zone — do nothing (no increment, no reset)
+        } else {
+          // OUTSIDE (>300m) — increment streak
           const s = deviationState.get(userId) || { count: 0 };
           s.count++;
           deviationState.set(userId, s);
 
           if (s.count >= 3) {
-            // 🚨 DEVIATED — log to DB, alert dashboard
-            const destRaw = await redis.get(`nav:dest:${userId}`);
-            const destData = destRaw ? JSON.parse(destRaw) : {};
+            console.log(`[deviation] 🚨 ${userId} OUTSIDE corridor | streak=${s.count}`);
 
-            // Compute approximate distance from route
-            const routeRaw = await redis.get(`nav:route:${userId}`);
-            let distFromRoute = null;
-            if (routeRaw) {
-              const routePts = JSON.parse(routeRaw);
-              let minDist = Infinity;
-              for (let i = 0; i < routePts.length; i++) {
-                const d = haversineDistance(finalLat, finalLng, routePts[i].lat, routePts[i].lng);
-                if (d < minDist) minDist = d;
-              }
-              distFromRoute = Math.round(minDist);
-            }
-
-            // Find active session ID in DB (best-effort)
-            let dbSessionId = null;
-            try {
-              const sessionMeta = streamMeta.sessionId;
-              if (sessionMeta) {
-                const sr = await pool.query(
-                  `SELECT id FROM sessions WHERE session_name = $1 ORDER BY id DESC LIMIT 1`,
-                  [sessionMeta]
-                );
-                if (sr.rows.length) dbSessionId = sr.rows[0].id;
-              }
-            } catch {}
-
-            // Insert deviation record
-            try {
-              await pool.query(
-                `INSERT INTO deviations (user_id, session_id, lat, lng, h3_cell, distance_from_route, zone, consecutive, destination_name)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-                [userId, dbSessionId, finalLat, finalLng, h3Cell, distFromRoute, 'OUTSIDE', s.count, destData.name || null]
-              );
-            } catch (e) {
-              console.error("[deviation] DB insert failed:", e.message);
-            }
-
-            // Store active deviation in Redis for dashboard polling
-            const devPayload = {
+            deviationAlert = {
               userId,
               lat: finalLat,
               lng: finalLng,
               h3Cell,
-              distanceFromRoute: distFromRoute,
+              zone: "OUTSIDE",
               consecutive: s.count,
               destinationName: destData.name || null,
               detectedAt: now,
             };
-            await redis.set(`deviation:${userId}`, JSON.stringify(devPayload), { EX: SESSION_TTL });
 
-            // Publish deviation alert via the same pub/sub channel
+            await redis.set(`deviation:${userId}`, JSON.stringify(deviationAlert), { EX: SESSION_TTL });
+
             await redis.publish(CHANNEL, JSON.stringify({
               event: "deviation_alert",
-              ...devPayload,
+              ...deviationAlert,
               roomNames: streamMeta.roomNames,
               streamKey: streamMeta.streamKey,
             }));
 
-            deviationAlert = devPayload;
-            console.log(`[deviation] 🚨 ${userId} deviated | ${distFromRoute}m from route | streak=${s.count}`);
+            // DB insert (best-effort)
+            pool.query(
+              `INSERT INTO deviations (user_id, lat, lng, h3_cell, zone, consecutive, destination_name)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+              [userId, finalLat, finalLng, h3Cell, 'OUTSIDE', s.count, destData.name || null]
+            ).catch((e) => console.error("[deviation] DB insert failed:", e.message));
           }
+        }
+      }
+
+      // ── Inactivity detection ───────────────────────────────────
+      // Stationary >15min outside the destination zone → flag
+      if (!arrivalDetected) {
+        const isMoving = typeof req.body.moving === "boolean" ? req.body.moving : true;
+        const inactKey = `inactivity:${userId}`;
+
+        if (!isMoving) {
+          const inactRaw = await redis.get(inactKey);
+          if (!inactRaw) {
+            // First stationary ping — record the timestamp
+            await redis.set(inactKey, JSON.stringify({
+              since: now,
+              lat: finalLat,
+              lng: finalLng,
+            }), { EX: SESSION_TTL });
+          } else {
+            const inactData = JSON.parse(inactRaw);
+            const stationarySecs = (Date.now() - new Date(inactData.since).getTime()) / 1000;
+
+            if (stationarySecs >= INACTIVITY_THRESHOLD_S && distToDest > ARRIVAL_RADIUS_M * 2) {
+              inactivityFlag = true;
+              console.log(`[inactivity] ⚠️ ${userId} stationary ${Math.round(stationarySecs)}s at ${finalLat.toFixed(4)},${finalLng.toFixed(4)}`);
+
+              // Publish inactivity alert
+              await redis.publish(CHANNEL, JSON.stringify({
+                event: "inactivity_alert",
+                userId,
+                lat: finalLat,
+                lng: finalLng,
+                stationarySecs: Math.round(stationarySecs),
+                since: inactData.since,
+                destinationName: destData.name || null,
+                timestamp: now,
+                roomNames: streamMeta.roomNames,
+                streamKey: streamMeta.streamKey,
+              }));
+            }
+          }
+        } else {
+          // User is moving — clear inactivity timer
+          await redis.del(inactKey);
         }
       }
     }
@@ -433,7 +571,7 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       if (pending) forceRefresh = true;
     }
 
-    return res.status(200).json({ ok: true, data: payload, forceRefresh, deviationAlert });
+    return res.status(200).json({ ok: true, data: payload, forceRefresh, deviationAlert, arrivalDetected, inactivityFlag });
   } catch (err) {
     console.error("[POST /:id/ping] Error:", err.message);
     return res.status(500).json({ error: "Internal server error" });
