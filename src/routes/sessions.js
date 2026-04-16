@@ -3,7 +3,9 @@ const { pool } = require("../db");
 
 const router = Router();
 
-const SESSION_FIELDS = `id, user_id, session_name, started_at, ended_at, duration_secs, total_pings, start_location, end_location, created_at`;
+const SESSION_FIELDS = `id, user_id, session_name, status, trip_type, started_at, ended_at, duration_secs, total_pings,
+  start_location, end_location, origin_lat, origin_lng, dest_lat, dest_lng, dest_label,
+  route_polyline, route_h3_corridor, total_distance_m, deviation_count, created_at`;
 
 // ── GET /sessions/all ────────────────────────────────────────────────
 
@@ -52,7 +54,8 @@ router.get("/:sessionId/logs", async (req, res) => {
     const [countResult, result] = await Promise.all([
       pool.query("SELECT COUNT(*) AS total FROM location_logs WHERE session_id = $1", [sid]),
       pool.query(
-        `SELECT lat, lng, recorded_at FROM location_logs
+        `SELECT lat, lng, h3_cell, speed_kmh, accuracy_m, deviation_flag, inactivity_flag, recorded_at
+         FROM location_logs
          WHERE session_id = $1 ORDER BY recorded_at ASC LIMIT $2 OFFSET $3`,
         [sid, limit, offset]
       ),
@@ -151,6 +154,48 @@ router.get("/:sessionId/deviations", async (req, res) => {
     return res.status(200).json({ ok: true, data: result.rows });
   } catch (err) {
     console.error("[GET /session/:id/deviations] Error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ── GET /session/:sessionId/events — full audit trail for a session ──
+
+router.get("/:sessionId/events", async (req, res) => {
+  try {
+    const sid = parseInt(req.params.sessionId, 10);
+    if (isNaN(sid)) {
+      return res.status(400).json({ error: "Invalid session id" });
+    }
+
+    const result = await pool.query(
+      `SELECT id, session_id, user_id, event_type, occurred_at, lat, lng, h3_cell, metadata
+       FROM session_events WHERE session_id = $1 ORDER BY occurred_at ASC`,
+      [sid]
+    );
+
+    return res.status(200).json({ ok: true, data: result.rows });
+  } catch (err) {
+    console.error("[GET /session/:id/events] Error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ── GET /user/:id/events — all events for a user across all sessions ──
+
+router.get("/user/:id/events", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+
+    const result = await pool.query(
+      `SELECT id, session_id, user_id, event_type, occurred_at, lat, lng, h3_cell, metadata
+       FROM session_events WHERE user_id = $1 ORDER BY occurred_at DESC LIMIT $2`,
+      [id, limit]
+    );
+
+    return res.status(200).json({ ok: true, data: result.rows });
+  } catch (err) {
+    console.error("[GET /user/:id/events] Error:", err.message);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
