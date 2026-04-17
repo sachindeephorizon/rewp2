@@ -667,6 +667,18 @@ router.post("/:id/stop", async (req, res) => {
     );
     const dbSessionId = sessionResult.rows[0].id;
 
+    // Diagnostic: log what we're about to insert for the first point
+    if (parsedLogs.length > 0) {
+      const sample = parsedLogs[0];
+      console.log(`[stop] Sample log shape:`, JSON.stringify({
+        keys: Object.keys(sample),
+        speed: sample.speed,
+        speedType: typeof sample.speed,
+        accuracy: sample.accuracy,
+        accuracyType: typeof sample.accuracy,
+      }));
+    }
+
     const batchSize = 500;
     for (let b = 0; b < parsedLogs.length; b += batchSize) {
       const batch  = parsedLogs.slice(b, b + batchSize);
@@ -676,7 +688,8 @@ router.post("/:id/stop", async (req, res) => {
         const offset = index * 7;
         values.push(`($${offset+1},$${offset+2},$${offset+3},$${offset+4},$${offset+5},$${offset+6},$${offset+7})`);
         const speedKmh = typeof point.speed === 'number' ? point.speed * 3.6 : null;
-        params.push(dbSessionId, point.lat, point.lng, point.h3Cell || null, speedKmh, point.accuracy || null, point.timestamp);
+        const accuracyVal = typeof point.accuracy === 'number' ? point.accuracy : null;
+        params.push(dbSessionId, point.lat, point.lng, point.h3Cell || null, speedKmh, accuracyVal, point.timestamp);
       });
       await pool.query(
         `INSERT INTO location_logs (session_id, lat, lng, h3_cell, speed_kmh, accuracy_m, recorded_at) VALUES ${values.join(",")}`,
