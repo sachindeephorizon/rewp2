@@ -5,14 +5,41 @@ import { ACTIVE_SET } from "../config";
 
 const router = Router();
 
+async function loadFallbackActiveUserIds(limit: number): Promise<string[]> {
+  const ids = new Set<string>();
+  for await (const key of redis.scanIterator({
+    MATCH: "session:*:start",
+    COUNT: Math.max(limit, 100),
+  })) {
+    const parts = String(key).split(":");
+    if (parts.length >= 3 && parts[0] === "session" && parts[parts.length - 1] === "start") {
+      const userId = parts.slice(1, -1).join(":");
+      if (userId) ids.add(userId);
+    }
+    if (ids.size >= limit) break;
+  }
+  return Array.from(ids);
+}
+
 router.get("/active", async (req: Request, res: Response) => {
   try {
     const limit = Math.min(parseInt(req.query.limit as string, 10) || 50, 200);
     const cursor = parseInt((req.query.cursor as string) || "0", 10);
 
     const scanResult = await redis.sScan(ACTIVE_SET, cursor, { COUNT: limit });
-    const nextCursor = scanResult.cursor;
-    const userIds = scanResult.members;
+    let nextCursor = scanResult.cursor;
+    let userIds = scanResult.members;
+
+    // Fallback source of truth: live session keys.
+    // This prevents empty responses when ACTIVE_SET was lost (e.g. Redis restart).
+    if (userIds.length === 0) {
+      const fallbackUserIds = await loadFallbackActiveUserIds(limit);
+      if (fallbackUserIds.length > 0) {
+        userIds = fallbackUserIds;
+        nextCursor = 0;
+        redis.sAdd(ACTIVE_SET, fallbackUserIds).catch(() => {});
+      }
+    }
 
     if (userIds.length === 0) {
       res.status(200).json({ ok: true, data: [], cursor: "0", hasMore: false });
