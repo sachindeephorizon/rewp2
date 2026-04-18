@@ -280,10 +280,10 @@ router.post('/checkin/:user_id/missed', async (req: Request<{ user_id: string }>
     entrySession.safety_signals.soc = 'alerted';
   }
 
-  // Escalate to next tier
+  // Per PRD + product spec: missed check-in jumps DIRECTLY to Tier 3 (emergency).
+  // This is the strongest possible signal that the user can't respond.
   if (session.tier < 3) {
-    const newTier = (session.tier + 1) as Tier;
-    await shiftTier(session, newTier, 'missed_checkin');
+    await shiftTier(session, 3, 'missed_checkin');
   }
 
   res.json({
@@ -293,7 +293,7 @@ router.post('/checkin/:user_id/missed', async (req: Request<{ user_id: string }>
     tier_name: TIER_CONFIG[session.tier].name,
     interval_minutes: session.interval_minutes,
     missed_count: session.missed_count,
-    trigger_escalation: session.tier === 3,
+    trigger_escalation: true,
     next_checkin_at: session.next_checkin_at,
     timestamp: new Date().toISOString()
   });

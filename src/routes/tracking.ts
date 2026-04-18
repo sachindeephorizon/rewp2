@@ -207,7 +207,9 @@ const ARRIVAL_RADIUS_M = 200;
 
 // ── Inactivity (distance-window) ─────────────────────────────────────────────
 // Per PRD: distance covered in the last 10 min < 30 m AND not near destination.
-const INACTIVITY_WINDOW_S = 600;          // 10 minutes
+// TESTING: window shortened to 60s so emulator demos don't take 10 minutes to fire.
+// Production value: 600 (10 min).
+const INACTIVITY_WINDOW_S = 60;
 const INACTIVITY_DISTANCE_M = 30;         // total displacement threshold
 const INACTIVITY_NEAR_DEST_M = ARRIVAL_RADIUS_M * 2; // suppress when ≈ at destination
 
