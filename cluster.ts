@@ -6,10 +6,10 @@
  * ═══════════════════════════════════════════════════════════════════
  */
 
-const cluster = require("cluster");
-const os = require("os");
+import cluster from "cluster";
+import os from "os";
 
-const NUM_WORKERS = parseInt(process.env.WORKERS) || os.cpus().length;
+const NUM_WORKERS = parseInt(process.env.WORKERS || "", 10) || os.cpus().length;
 
 if (cluster.isPrimary) {
   console.log(`[Cluster] Primary ${process.pid} starting ${NUM_WORKERS} workers...`);
@@ -23,5 +23,5 @@ if (cluster.isPrimary) {
     cluster.fork();
   });
 } else {
-  require("./src/index.js");
+  require("./src/index");
 }

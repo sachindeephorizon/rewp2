@@ -1,4 +1,4 @@
-const { createClient } = require("redis");
+import { createClient } from "redis";
 
 const REDIS_URL = process.env.REDIS_URL;
 
@@ -11,7 +11,7 @@ const ioSub = redis.duplicate();
 
 // ── Connection helpers ──────────────────────────────────────────────
 
-async function connectRedis() {
+async function connectRedis(): Promise<void> {
   try {
     await redis.connect();
     console.log("[Redis] Main client connected");
@@ -23,12 +23,12 @@ async function connectRedis() {
     await ioSub.connect();
     console.log("[Redis] Socket.io adapter clients connected");
   } catch (err) {
-    console.error("[Redis] Failed to connect:", err.message);
+    console.error("[Redis] Failed to connect:", (err as Error).message);
     process.exit(1);
   }
 }
 
-redis.on("error", (err) => console.error("[Redis:main] error:", err.message));
-subscriber.on("error", (err) => console.error("[Redis:sub] error:", err.message));
+redis.on("error", (err: Error) => console.error("[Redis:main] error:", err.message));
+subscriber.on("error", (err: Error) => console.error("[Redis:sub] error:", err.message));
 
-module.exports = { redis, subscriber, ioPub, ioSub, connectRedis };
+export { redis, subscriber, ioPub, ioSub, connectRedis };

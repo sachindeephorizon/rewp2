@@ -1,0 +1,9 @@
+export const LOCATION_TTL = 3600;
+export const SESSION_TTL = 86400;
+export const TRAIL_MIN_DISTANCE = 5;
+export const CHANNEL = "location_updates";
+export const ACTIVE_SET = "active_users";
+export const SOCKET_GLOBAL_EVENT = "locationUpdate";
+export const SOCKET_STREAM_EVENT = "stream:update";
+export const SOCKET_STOP_EVENT = "stream:stop";
+export const GLOBAL_EMIT_INTERVAL_MS = 2000;

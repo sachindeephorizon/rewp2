@@ -11,32 +11,38 @@
  * ═══════════════════════════════════════════════════════════════════
  */
 
+import type { ProcessedLocation, KalmanState, GpsUserState } from "../types";
+import type { createClient } from "redis";
+
+type RedisClient = ReturnType<typeof createClient>;
+
 const MAX_SPEED_MS = 80;          // ~290 km/h
 const STATIONARY_THRESHOLD = 4;   // meters
 const MAX_JUMP_DIST = 300;        // meters
 const MAX_DT = 60;                // seconds — covers Doze gaps
 const ACCURACY_THRESHOLD = 35;    // meters
-const MAX_FILTER_STREAK = 3;      // reset after 3 consecutive filtered points
-const GAP_RESET_SECONDS = 60;     // if gap > 60s, treat as fresh start
+export const MAX_FILTER_STREAK = 3;      // reset after 3 consecutive filtered points
+export const GAP_RESET_SECONDS = 60;     // if gap > 60s, treat as fresh start
 
 // ── 2D Kalman Filter ────────────────────────────────────────────────
-class KalmanFilter2D {
+export class KalmanFilter2D {
+  x: number[] | null;
+  v: number[];
+  P: number;
+  Q: number;
+  R: number;
+  stationaryCount: number;
+
   constructor() {
     this.x = null;
     this.v = [0, 0];
     this.P = 1;
-    // FIX: Q increased 0.00001 → 0.0001 (trust GPS measurement more,
-    // prediction less). Old value made filter over-trust velocity prediction
-    // on curves → points cut corners instead of following the road.
     this.Q = 0.0001;
-    // FIX: R increased 0.0001 → 0.001 (allow more correction toward
-    // actual GPS reading). Combined with higher Q, filter now follows
-    // real movement more closely instead of smoothing over turns.
     this.R = 0.001;
     this.stationaryCount = 0;
   }
 
-  update(measurement, dt, accuracy, isStationary = false) {
+  update(measurement: number[], dt: number, accuracy: number, isStationary = false): number[] {
     if (!this.x) {
       this.x = [...measurement];
       return this.x;
@@ -77,14 +83,14 @@ class KalmanFilter2D {
     return this.x;
   }
 
-  reset() {
+  reset(): void {
     this.x = null;
     this.v = [0, 0];
     this.P = 1;
     this.stationaryCount = 0;
   }
 
-  toJSON() {
+  toJSON(): KalmanState {
     return {
       x: this.x, v: this.v, P: this.P,
       Q: this.Q, R: this.R,
@@ -92,7 +98,7 @@ class KalmanFilter2D {
     };
   }
 
-  fromJSON(data) {
+  fromJSON(data: Partial<KalmanState> | null): void {
     if (!data) return;
     this.x = data.x ?? null;
     this.v = data.v ?? [0, 0];
@@ -104,9 +110,9 @@ class KalmanFilter2D {
 }
 
 // ── Haversine Distance ──────────────────────────────────────────────
-function haversineDistance(lat1, lon1, lat2, lon2) {
+export function haversineDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const R = 6371000;
-  const toRad = (d) => (d * Math.PI) / 180;
+  const toRad = (d: number) => (d * Math.PI) / 180;
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
   const a =
@@ -117,7 +123,14 @@ function haversineDistance(lat1, lon1, lat2, lon2) {
 }
 
 // ── Process Location ────────────────────────────────────────────────
-function processLocation(newLat, newLng, prevEntry, kalman, accuracy = null, timestamp = null) {
+export function processLocation(
+  newLat: number,
+  newLng: number,
+  prevEntry: ProcessedLocation | null,
+  kalman: KalmanFilter2D,
+  accuracy: number | null = null,
+  timestamp: number | null = null
+): ProcessedLocation | null {
   if (
     typeof newLat !== 'number' || typeof newLng !== 'number' ||
     newLat < -90 || newLat > 90 || newLng < -180 || newLng > 180
@@ -141,8 +154,6 @@ function processLocation(newLat, newLng, prevEntry, kalman, accuracy = null, tim
   const gapSeconds = (now - prevEntry.timestamp) / 1000;
 
   // GAP DETECTION: if too much time has passed since last ping
-  // (screen off, Doze, server restart, background gap), treat as
-  // fresh start — never filter based on distance/speed across a gap.
   if (gapSeconds > GAP_RESET_SECONDS) {
     console.log(
       `[gps] Gap detected: ${gapSeconds.toFixed(0)}s — accepting as fresh start`
@@ -188,24 +199,30 @@ function processLocation(newLat, newLng, prevEntry, kalman, accuracy = null, tim
 }
 
 // ── Per-user state — Redis-backed ───────────────────────────────────
-let _redis = null;
-const memCache = new Map();
+let _redis: RedisClient | null = null;
+const memCache = new Map<string, GpsUserState>();
 
-function initGpsState(redisClient) {
+export function initGpsState(redisClient: RedisClient): void {
   _redis = redisClient;
 }
 
-async function getUserState(userId) {
-  if (memCache.has(userId)) return memCache.get(userId);
+interface SavedGpsState {
+  prev: ProcessedLocation | null;
+  kalman: Partial<KalmanState>;
+  filterStreak: number;
+}
+
+export async function getUserState(userId: string): Promise<GpsUserState> {
+  if (memCache.has(userId)) return memCache.get(userId)!;
 
   const stateKey = `gpsstate:${userId}`;
   try {
     const raw = _redis ? await _redis.get(stateKey) : null;
     if (raw) {
-      const saved = JSON.parse(raw);
+      const saved: SavedGpsState = JSON.parse(raw);
       const kalman = new KalmanFilter2D();
       kalman.fromJSON(saved.kalman);
-      const state = {
+      const state: GpsUserState = {
         prev: saved.prev || null,
         kalman,
         filterStreak: saved.filterStreak || 0,
@@ -215,15 +232,15 @@ async function getUserState(userId) {
       return state;
     }
   } catch (e) {
-    console.error('[gps] Failed to restore state:', e.message);
+    console.error('[gps] Failed to restore state:', (e as Error).message);
   }
 
-  const state = { prev: null, kalman: new KalmanFilter2D(), filterStreak: 0 };
+  const state: GpsUserState = { prev: null, kalman: new KalmanFilter2D(), filterStreak: 0 };
   memCache.set(userId, state);
   return state;
 }
 
-async function saveUserState(userId) {
+export async function saveUserState(userId: string): Promise<void> {
   const state = memCache.get(userId);
   if (!state || !_redis) return;
   try {
@@ -233,23 +250,11 @@ async function saveUserState(userId) {
       filterStreak: state.filterStreak,
     }));
   } catch (e) {
-    console.error('[gps] Failed to save state:', e.message);
+    console.error('[gps] Failed to save state:', (e as Error).message);
   }
 }
 
-function clearUserState(userId) {
+export function clearUserState(userId: string): void {
   memCache.delete(userId);
   if (_redis) _redis.del(`gpsstate:${userId}`).catch(() => {});
 }
-
-module.exports = {
-  processLocation,
-  getUserState,
-  saveUserState,
-  clearUserState,
-  initGpsState,
-  haversineDistance,
-  KalmanFilter2D,
-  MAX_FILTER_STREAK,
-  GAP_RESET_SECONDS,
-};

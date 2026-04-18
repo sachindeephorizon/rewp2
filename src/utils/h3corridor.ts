@@ -1,19 +1,15 @@
-'use strict';
-
-const h3 = require('h3-js');
+import * as h3 from "h3-js";
+import type { LatLng } from "../types";
 
 const DEFAULT_RES = 9;
 const EARTH_RADIUS_M = 6_371_000;
 
-// FIX: was 50m — caused massive corridor blob overlap because dense interpolation
-// + k=2 gridDisk rings merged into one giant zone, leaving no OUTSIDE zone at all.
-// Resolution 10 edge ≈ 65m, so 30m is tight enough to prevent cell gaps while
-// keeping the corridor set lean.
+// FIX: was 50m — caused massive corridor blob overlap
 const MAX_GAP_M = 30;
 
 // ─── Haversine distance (metres) ────────────────────────────────────────────
 
-function haversineM(lat1, lng1, lat2, lng2) {
+function haversineM(lat1: number, lng1: number, lat2: number, lng2: number): number {
   const toRad = Math.PI / 180;
   const dLat = (lat2 - lat1) * toRad;
   const dLng = (lng2 - lng1) * toRad;
@@ -25,12 +21,12 @@ function haversineM(lat1, lng1, lat2, lng2) {
 
 // ─── Linear interpolation along a segment ───────────────────────────────────
 
-function interpolateSegment(p1, p2, maxGap) {
+function interpolateSegment(p1: LatLng, p2: LatLng, maxGap: number): LatLng[] {
   const dist = haversineM(p1.lat, p1.lng, p2.lat, p2.lng);
   if (dist <= maxGap) return [p1];
 
   const steps = Math.ceil(dist / maxGap);
-  const pts = [];
+  const pts: LatLng[] = [];
   for (let i = 0; i < steps; i++) {
     const t = i / steps;
     pts.push({
@@ -43,11 +39,11 @@ function interpolateSegment(p1, p2, maxGap) {
 
 // ─── Interpolate full route ─────────────────────────────────────────────────
 
-function interpolateRoute(routePoints, maxGap = MAX_GAP_M) {
+function interpolateRoute(routePoints: LatLng[], maxGap = MAX_GAP_M): LatLng[] {
   if (routePoints.length === 0) return [];
   if (routePoints.length === 1) return [routePoints[0]];
 
-  const out = [];
+  const out: LatLng[] = [];
   for (let i = 0; i < routePoints.length - 1; i++) {
     const seg = interpolateSegment(routePoints[i], routePoints[i + 1], maxGap);
     for (let j = 0; j < seg.length; j++) out.push(seg[j]);
@@ -61,32 +57,26 @@ function interpolateRoute(routePoints, maxGap = MAX_GAP_M) {
 /**
  * Convert a single lat/lng to its H3 cell index.
  */
-function latLngToH3Cell(lat, lng, resolution = DEFAULT_RES) {
+export function latLngToH3Cell(lat: number, lng: number, resolution = DEFAULT_RES): string {
   return h3.latLngToCell(lat, lng, resolution);
+}
+
+interface CorridorOptions {
+  resolution?: number;
+  buffer?: number;
 }
 
 /**
  * Build an H3 corridor from an OSRM-decoded route.
- *
- * Resolution 10, edge ≈ 65m:
- *   buffer=1 → ~130m safe zone  (INNER)
- *   buffer=2 → ~260m buffer zone (OUTER)
- *   beyond   → OUTSIDE — triggers deviation after 3 consecutive pings
- *
- * @param {Array<{lat: number, lng: number}>} routePoints
- * @param {object} [opts]
- * @param {number} [opts.resolution=9]
- * @param {number} [opts.buffer=1]
- * @returns {string[]} Unique array of H3 index strings
  */
-function buildH3Corridor(routePoints, opts = {}) {
+export function buildH3Corridor(routePoints: LatLng[], opts: CorridorOptions = {}): string[] {
   const resolution = opts.resolution || DEFAULT_RES;
   const buffer = opts.buffer != null ? opts.buffer : 1;
 
   if (!routePoints || routePoints.length === 0) return [];
 
   const dense = interpolateRoute(routePoints);
-  const cellSet = new Set();
+  const cellSet = new Set<string>();
 
   for (let i = 0; i < dense.length; i++) {
     const center = h3.latLngToCell(dense[i].lat, dense[i].lng, resolution);
@@ -105,12 +95,6 @@ function buildH3Corridor(routePoints, opts = {}) {
 /**
  * Check whether an H3 index falls inside a pre-built corridor.
  */
-function isInCorridor(h3Index, corridorSet) {
+export function isInCorridor(h3Index: string, corridorSet: Set<string>): boolean {
   return corridorSet.has(h3Index);
 }
-
-module.exports = {
-  buildH3Corridor,
-  latLngToH3Cell,
-  isInCorridor,
-};

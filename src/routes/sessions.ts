@@ -1,5 +1,5 @@
-const { Router } = require("express");
-const { pool } = require("../db");
+import { Router, type Request, type Response } from "express";
+import { pool } from "../db";
 
 const router = Router();
 
@@ -9,10 +9,10 @@ const SESSION_FIELDS = `id, user_id, session_name, status, trip_type, started_at
 
 // ── GET /sessions/all ────────────────────────────────────────────────
 
-router.get("/all", async (req, res) => {
+router.get("/all", async (req: Request, res: Response) => {
   try {
-    const page = Math.max(parseInt(req.query.page) || 1, 1);
-    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const page = Math.max(parseInt(req.query.page as string) || 1, 1);
+    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
     const offset = (page - 1) * limit;
 
     const [countResult, result] = await Promise.all([
@@ -23,9 +23,9 @@ router.get("/all", async (req, res) => {
       ),
     ]);
 
-    const total = parseInt(countResult.rows[0].total, 10);
+    const total = parseInt(countResult.rows[0].total as string, 10);
 
-    return res.status(200).json({
+    res.status(200).json({
       ok: true,
       data: result.rows,
       total,
@@ -34,21 +34,22 @@ router.get("/all", async (req, res) => {
       totalPages: Math.ceil(total / limit),
     });
   } catch (err) {
-    console.error("[GET /sessions/all] Error:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    console.error("[GET /sessions/all] Error:", (err as Error).message);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // ── GET /session/:sessionId/logs ────────────────────────────────────
 
-router.get("/:sessionId/logs", async (req, res) => {
+router.get("/:sessionId/logs", async (req: Request, res: Response) => {
   try {
-    const sid = parseInt(req.params.sessionId, 10);
+    const sid = parseInt(req.params.sessionId as string, 10);
     if (isNaN(sid)) {
-      return res.status(400).json({ error: "Invalid session id" });
+      res.status(400).json({ error: "Invalid session id" });
+      return;
     }
-    const page = Math.max(parseInt(req.query.page) || 1, 1);
-    const limit = Math.min(parseInt(req.query.limit) || 500, 2000);
+    const page = Math.max(parseInt(req.query.page as string) || 1, 1);
+    const limit = Math.min(parseInt(req.query.limit as string) || 500, 2000);
     const offset = (page - 1) * limit;
 
     const [countResult, result] = await Promise.all([
@@ -61,9 +62,9 @@ router.get("/:sessionId/logs", async (req, res) => {
       ),
     ]);
 
-    const total = parseInt(countResult.rows[0].total, 10);
+    const total = parseInt(countResult.rows[0].total as string, 10);
 
-    return res.status(200).json({
+    res.status(200).json({
       ok: true,
       data: result.rows,
       total,
@@ -72,18 +73,19 @@ router.get("/:sessionId/logs", async (req, res) => {
       totalPages: Math.ceil(total / limit),
     });
   } catch (err) {
-    console.error("[GET /session/:id/logs] Error:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    console.error("[GET /session/:id/logs] Error:", (err as Error).message);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // ── DELETE /session/:sessionId ──────────────────────────────────────
 
-router.delete("/:sessionId", async (req, res) => {
+router.delete("/:sessionId", async (req: Request, res: Response) => {
   try {
-    const sid = parseInt(req.params.sessionId, 10);
+    const sid = parseInt(req.params.sessionId as string, 10);
     if (isNaN(sid)) {
-      return res.status(400).json({ error: "Invalid session id" });
+      res.status(400).json({ error: "Invalid session id" });
+      return;
     }
 
     const result = await pool.query(
@@ -92,23 +94,24 @@ router.delete("/:sessionId", async (req, res) => {
     );
 
     if (result.rowCount === 0) {
-      return res.status(404).json({ error: "Session not found" });
+      res.status(404).json({ error: "Session not found" });
+      return;
     }
 
-    return res.status(200).json({ ok: true, deleted: sid });
+    res.status(200).json({ ok: true, deleted: sid });
   } catch (err) {
-    console.error("[DELETE /session/:id] Error:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    console.error("[DELETE /session/:id] Error:", (err as Error).message);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // ── GET /user/:id/sessions ──────────────────────────────────────────
 
-router.get("/user/:id", async (req, res) => {
+router.get("/user/:id", async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const page = Math.max(parseInt(req.query.page) || 1, 1);
-    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const page = Math.max(parseInt(req.query.page as string) || 1, 1);
+    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
     const offset = (page - 1) * limit;
 
     const [countResult, result] = await Promise.all([
@@ -119,9 +122,9 @@ router.get("/user/:id", async (req, res) => {
       ),
     ]);
 
-    const total = parseInt(countResult.rows[0].total, 10);
+    const total = parseInt(countResult.rows[0].total as string, 10);
 
-    return res.status(200).json({
+    res.status(200).json({
       ok: true,
       data: result.rows,
       total,
@@ -130,18 +133,19 @@ router.get("/user/:id", async (req, res) => {
       totalPages: Math.ceil(total / limit),
     });
   } catch (err) {
-    console.error("[GET /user/:id/sessions] Error:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    console.error("[GET /user/:id/sessions] Error:", (err as Error).message);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // ── GET /session/:sessionId/deviations ──────────────────────────────
 
-router.get("/:sessionId/deviations", async (req, res) => {
+router.get("/:sessionId/deviations", async (req: Request, res: Response) => {
   try {
-    const sid = parseInt(req.params.sessionId, 10);
+    const sid = parseInt(req.params.sessionId as string, 10);
     if (isNaN(sid)) {
-      return res.status(400).json({ error: "Invalid session id" });
+      res.status(400).json({ error: "Invalid session id" });
+      return;
     }
 
     const result = await pool.query(
@@ -151,20 +155,21 @@ router.get("/:sessionId/deviations", async (req, res) => {
       [sid]
     );
 
-    return res.status(200).json({ ok: true, data: result.rows });
+    res.status(200).json({ ok: true, data: result.rows });
   } catch (err) {
-    console.error("[GET /session/:id/deviations] Error:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    console.error("[GET /session/:id/deviations] Error:", (err as Error).message);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// ── GET /session/:sessionId/events — full audit trail for a session ──
+// ── GET /session/:sessionId/events ──────────────────────────────────
 
-router.get("/:sessionId/events", async (req, res) => {
+router.get("/:sessionId/events", async (req: Request, res: Response) => {
   try {
-    const sid = parseInt(req.params.sessionId, 10);
+    const sid = parseInt(req.params.sessionId as string, 10);
     if (isNaN(sid)) {
-      return res.status(400).json({ error: "Invalid session id" });
+      res.status(400).json({ error: "Invalid session id" });
+      return;
     }
 
     const result = await pool.query(
@@ -173,19 +178,19 @@ router.get("/:sessionId/events", async (req, res) => {
       [sid]
     );
 
-    return res.status(200).json({ ok: true, data: result.rows });
+    res.status(200).json({ ok: true, data: result.rows });
   } catch (err) {
-    console.error("[GET /session/:id/events] Error:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    console.error("[GET /session/:id/events] Error:", (err as Error).message);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// ── GET /user/:id/events — all events for a user across all sessions ──
+// ── GET /user/:id/events ────────────────────────────────────────────
 
-router.get("/user/:id/events", async (req, res) => {
+router.get("/user/:id/events", async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+    const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
 
     const result = await pool.query(
       `SELECT id, session_id, user_id, event_type, occurred_at, lat, lng, h3_cell, metadata
@@ -193,19 +198,19 @@ router.get("/user/:id/events", async (req, res) => {
       [id, limit]
     );
 
-    return res.status(200).json({ ok: true, data: result.rows });
+    res.status(200).json({ ok: true, data: result.rows });
   } catch (err) {
-    console.error("[GET /user/:id/events] Error:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    console.error("[GET /user/:id/events] Error:", (err as Error).message);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// ── GET /user/:id/deviations — all deviations for a user ───────────
+// ── GET /user/:id/deviations ────────────────────────────────────────
 
-router.get("/user/:id/deviations", async (req, res) => {
+router.get("/user/:id/deviations", async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
 
     const result = await pool.query(
       `SELECT id, session_id, lat, lng, h3_cell, distance_from_route, zone, consecutive,
@@ -214,11 +219,11 @@ router.get("/user/:id/deviations", async (req, res) => {
       [id, limit]
     );
 
-    return res.status(200).json({ ok: true, data: result.rows });
+    res.status(200).json({ ok: true, data: result.rows });
   } catch (err) {
-    console.error("[GET /user/:id/deviations] Error:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    console.error("[GET /user/:id/deviations] Error:", (err as Error).message);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-module.exports = router;
+export default router;

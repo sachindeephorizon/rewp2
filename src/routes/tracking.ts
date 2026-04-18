@@ -1,7 +1,7 @@
-const { Router } = require("express");
-const { redis } = require("../redis");
-const { pool } = require("../db");
-const {
+import { Router, type Request, type Response } from "express";
+import { redis } from "../redis";
+import { pool } from "../db";
+import {
   processLocation,
   getUserState,
   saveUserState,
@@ -9,41 +9,35 @@ const {
   haversineDistance,
   MAX_FILTER_STREAK,
   GAP_RESET_SECONDS,
-} = require("../utils/gps");
-const { reverseGeocode } = require("../utils/geocode");
-const { rateLimitPing } = require("../utils/rateLimit");
-const { snapToRoad, snapTrajectory } = require("../utils/snapToRoad");
-const { latLngToH3Cell } = require("../utils/h3corridor");
-
-// FIX: Removed in-memory deviationState Map.
-// It was resetting on every server restart (Railway free tier sleeps frequently),
-// silently zeroing the streak counter mid-simulation and preventing deviation
-// alerts from ever reaching 3 consecutive hits.
-// Replaced with Redis-backed streak: `devstreak:{userId}` → { count: number }
-
-const {
+} from "../utils/gps";
+import { reverseGeocode } from "../utils/geocode";
+import { rateLimitPing } from "../utils/rateLimit";
+import { snapToRoad, snapTrajectory } from "../utils/snapToRoad";
+import { latLngToH3Cell } from "../utils/h3corridor";
+import {
   LOCATION_TTL,
   SESSION_TTL,
   TRAIL_MIN_DISTANCE,
   CHANNEL,
   ACTIVE_SET,
-} = require("../config");
-const { buildStreamMetadata } = require("../utils/stream");
+} from "../config";
+import { buildStreamMetadata } from "../utils/stream";
+import type { StreamMetadata, DestinationData, DeviationAlert, LocationPayload, PingBody, SessionMeta } from "../types";
 
 const router = Router();
 
 // ── Deviation streak helpers (Redis-backed) ──────────────────────────────────
 
-async function getDeviationStreak(userId) {
+async function getDeviationStreak(userId: string): Promise<number> {
   try {
     const raw = await redis.get(`devstreak:${userId}`);
-    return raw ? JSON.parse(raw).count : 0;
+    return raw ? (JSON.parse(raw) as { count: number }).count : 0;
   } catch {
     return 0;
   }
 }
 
-async function setDeviationStreak(userId, count) {
+async function setDeviationStreak(userId: string, count: number): Promise<void> {
   await redis.set(
     `devstreak:${userId}`,
     JSON.stringify({ count }),
@@ -51,15 +45,25 @@ async function setDeviationStreak(userId, count) {
   );
 }
 
-async function clearDeviationStreak(userId) {
+async function clearDeviationStreak(userId: string): Promise<void> {
   await redis.del(`devstreak:${userId}`);
 }
 
 // ── Misc helpers ─────────────────────────────────────────────────────────────
 
-const toNullableNumber = (value) => (
+const toNullableNumber = (value: unknown): number | null => (
   typeof value === "number" && Number.isFinite(value) ? value : null
 );
+
+interface BuildLocationPayloadParams {
+  userId: string;
+  streamMeta: StreamMetadata;
+  sessionStartedAt: string;
+  now: string;
+  finalLat: number;
+  finalLng: number;
+  body: PingBody;
+}
 
 const buildLocationPayload = ({
   userId,
@@ -69,7 +73,7 @@ const buildLocationPayload = ({
   finalLat,
   finalLng,
   body,
-}) => ({
+}: BuildLocationPayloadParams): LocationPayload => ({
   event: "location_update",
   userId,
   driverId: streamMeta.driverId,
@@ -86,32 +90,29 @@ const buildLocationPayload = ({
   activity: typeof body.activity === "string" ? body.activity : null,
   source: typeof body.source === "string" ? body.source : null,
   appState: typeof body.appState === "string" ? body.appState : null,
-  sequence: Number.isInteger(body.sequence) ? body.sequence : null,
+  sequence: Number.isInteger(body.sequence) ? body.sequence! : null,
   gpsIntervalMs: toNullableNumber(body.gpsIntervalMs),
   timestamp: now,
   startedAt: sessionStartedAt,
   roomNames: streamMeta.roomNames,
 });
 
-// ── Deviation zone check (shared by filtered + normal ping paths) ─────────────
-// FIX: Both paths now use resolution 10 consistently (matches how corridor was built).
-// Old code used res=9 for h3Cell in the payload but res=10 for deviation checks —
-// confusing and wrong if anything accidentally used the payload cell for corridor lookup.
+// ── Deviation zone check ─────────────────────────────────────────────────────
 
-async function checkDeviation(userId, lat, lng, streamMeta, destData) {
-  // FIX: Always use resolution 10 — same resolution used when building nav:inner / nav:outer
+async function checkDeviation(
+  userId: string,
+  lat: number,
+  lng: number,
+  streamMeta: StreamMetadata,
+  destData: DestinationData
+): Promise<DeviationAlert | null> {
   const devCell = latLngToH3Cell(lat, lng, 10);
   const [inInner, inOuter] = await Promise.all([
     redis.sIsMember(`nav:inner:${userId}`, devCell),
     redis.sIsMember(`nav:outer:${userId}`, devCell),
   ]);
 
-  // Zone classification:
-  //   inInner → SAFE   (inner is a subset of outer, check inner first)
-  //   inOuter (but not inner) → BUFFER (GPS noise margin, ignore)
-  //   neither → OUTSIDE → increment streak → alert at 3
   if (inInner) {
-    // Back on route — reset streak and resolve any active deviation
     await setDeviationStreak(userId, 0);
     const activeDev = await redis.get(`deviation:${userId}`);
     if (activeDev) {
@@ -125,15 +126,13 @@ async function checkDeviation(userId, lat, lng, streamMeta, destData) {
         [userId, 'deviation_cleared', lat, lng]
       ).catch(() => {});
     }
-    return null; // no alert
-  }
-
-  if (inOuter) {
-    // Buffer zone — GPS noise, do nothing (no increment, no reset)
     return null;
   }
 
-  // OUTSIDE corridor — increment persistent streak
+  if (inOuter) {
+    return null;
+  }
+
   const prevCount = await getDeviationStreak(userId);
   const newCount = prevCount + 1;
   await setDeviationStreak(userId, newCount);
@@ -141,7 +140,7 @@ async function checkDeviation(userId, lat, lng, streamMeta, destData) {
   console.log(`[deviation] ${userId} OUTSIDE corridor | streak=${newCount}`);
 
   if (newCount >= 3) {
-    const alert = {
+    const alert: DeviationAlert = {
       userId,
       lat,
       lng,
@@ -165,9 +164,8 @@ async function checkDeviation(userId, lat, lng, streamMeta, destData) {
       `INSERT INTO deviations (user_id, lat, lng, h3_cell, zone, consecutive, destination_name)
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [userId, lat, lng, devCell, "OUTSIDE", newCount, destData.name || null]
-    ).catch((e) => console.error("[deviation] DB insert failed:", e.message));
+    ).catch((e: Error) => console.error("[deviation] DB insert failed:", e.message));
 
-    // Audit trail
     pool.query(
       `INSERT INTO session_events (user_id, event_type, lat, lng, h3_cell, metadata)
        VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -181,18 +179,24 @@ async function checkDeviation(userId, lat, lng, streamMeta, destData) {
   return null;
 }
 
-// ── Arrival check (shared) ────────────────────────────────────────────────────
+// ── Arrival check ────────────────────────────────────────────────────────────
 
-const ARRIVAL_RADIUS_M    = 200;
+const ARRIVAL_RADIUS_M = 200;
 const INACTIVITY_THRESHOLD_S = 900; // 15 minutes
 
-async function checkArrival(userId, lat, lng, destData, streamMeta, now) {
+async function checkArrival(
+  userId: string,
+  lat: number,
+  lng: number,
+  destData: DestinationData,
+  streamMeta: StreamMetadata,
+  now: string | null
+): Promise<boolean> {
   const distToDest = haversineDistance(lat, lng, destData.destination.lat, destData.destination.lng);
   if (distToDest >= ARRIVAL_RADIUS_M) return false;
 
   console.log(`[arrival] ✅ ${userId} arrived (${Math.round(distToDest)}m from dest)`);
 
-  // Audit trail
   pool.query(
     `INSERT INTO session_events (user_id, event_type, lat, lng, metadata)
      VALUES ($1, $2, $3, $4, $5)`,
@@ -206,7 +210,7 @@ async function checkArrival(userId, lat, lng, destData, streamMeta, now) {
     redis.del(`nav:outer:${userId}`),
     redis.del(`nav:route:${userId}`),
     redis.del(`deviation:${userId}`),
-    redis.del(`devstreak:${userId}`),   // FIX: also clear Redis-backed streak on arrival
+    redis.del(`devstreak:${userId}`),
     redis.del(`inactivity:${userId}`),
   ]);
 
@@ -227,28 +231,31 @@ async function checkArrival(userId, lat, lng, destData, streamMeta, now) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-router.post("/:id/ping", rateLimitPing, async (req, res) => {
+router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
   try {
-    const userId = req.params.id;
-    const { lat, lng, accuracy, timestamp } = req.body;
+    const userId = req.params.id as string;
+    const body = req.body as PingBody;
+    const { lat, lng, accuracy, timestamp } = body;
 
     if (!userId || typeof userId !== "string") {
-      return res.status(400).json({ error: "Invalid user id" });
+      res.status(400).json({ error: "Invalid user id" });
+      return;
     }
     if (typeof lat !== "number" || typeof lng !== "number") {
-      return res.status(400).json({ error: "lat and lng are required numbers" });
+      res.status(400).json({ error: "lat and lng are required numbers" });
+      return;
     }
-    if (lat < -90 || lat > 90)   return res.status(400).json({ error: "lat must be between -90 and 90" });
-    if (lng < -180 || lng > 180) return res.status(400).json({ error: "lng must be between -180 and 180" });
+    if (lat < -90 || lat > 90) { res.status(400).json({ error: "lat must be between -90 and 90" }); return; }
+    if (lng < -180 || lng > 180) { res.status(400).json({ error: "lng must be between -180 and 180" }); return; }
 
-    const userAccuracy  = typeof accuracy  === "number" ? accuracy  : null;
+    const userAccuracy = typeof accuracy === "number" ? accuracy : null;
     const userTimestamp = typeof timestamp === "number" ? timestamp : null;
 
     const streamMeta = buildStreamMetadata({
       userId,
-      sessionId:   req.body.sessionId,
-      rideChannel: req.body.rideChannel,
-      driverId:    req.body.driverId,
+      sessionId: body.sessionId,
+      rideChannel: body.rideChannel,
+      driverId: body.driverId,
     });
 
     const state = await getUserState(userId);
@@ -272,8 +279,6 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
     );
 
     // ── FILTERED PING ─────────────────────────────────────────────────────────
-    // GPS spike rejected by Kalman / speed / accuracy filter.
-    // Still run safety checks on RAW coordinates — safety > smoothness.
     if (!processed) {
       state.filterStreak = (state.filterStreak || 0) + 1;
 
@@ -285,12 +290,12 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
         await saveUserState(userId);
       }
 
-      let filteredDevAlert = null;
-      let filteredArrival  = false;
+      let filteredDevAlert: DeviationAlert | null = null;
+      let filteredArrival = false;
 
       const filteredDestRaw = await redis.get(`nav:dest:${userId}`);
       if (filteredDestRaw) {
-        const fd = JSON.parse(filteredDestRaw);
+        const fd = JSON.parse(filteredDestRaw) as DestinationData;
 
         filteredArrival = await checkArrival(userId, lat, lng, fd, streamMeta, null);
 
@@ -301,18 +306,19 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
 
       const pendingReq = await redis.get(`locreq:${userId}`);
 
-      return res.status(200).json({
+      res.status(200).json({
         ok: true,
         filtered: true,
         reason: "GPS spike rejected",
         streak: state.filterStreak,
-        streamKey:   streamMeta.streamKey,
+        streamKey: streamMeta.streamKey,
         rideChannel: streamMeta.rideChannel,
-        sessionId:   streamMeta.sessionId,
+        sessionId: streamMeta.sessionId,
         forceRefresh: !!pendingReq,
-        deviationAlert:  filteredDevAlert,
+        deviationAlert: filteredDevAlert,
         arrivalDetected: filteredArrival,
       });
+      return;
     }
 
     // ── ACCEPTED PING ─────────────────────────────────────────────────────────
@@ -322,7 +328,7 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
     const prevState = state.prev;
     const isRealMovement =
       !prevState ||
-      prevState.latitude  !== processed.latitude ||
+      prevState.latitude !== processed.latitude ||
       prevState.longitude !== processed.longitude;
 
     state.prev = processed;
@@ -335,17 +341,15 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
     const finalLat = snapped.lat;
     const finalLng = snapped.lng;
 
-    // FIX: Use resolution 10 for the payload h3Cell too, consistent with corridor checks.
-    // Old code stored res=9 in the payload but used res=10 for deviation — mismatch.
     const h3Cell = latLngToH3Cell(finalLat, finalLng, 10);
 
     const now = new Date().toISOString();
-    const redisKey        = `user:${userId}`;
+    const redisKey = `user:${userId}`;
     const sessionStartKey = `session:${userId}:start`;
-    const sessionMetaKey  = `session:${userId}:meta`;
-    const sessionLogsKey  = `session:${userId}:logs`;
-    const trailKey        = `trail:${userId}`;
-    const startMarkerKey  = `marker:${userId}:start`;
+    const sessionMetaKey = `session:${userId}:meta`;
+    const sessionLogsKey = `session:${userId}:logs`;
+    const trailKey = `trail:${userId}`;
+    const startMarkerKey = `marker:${userId}:start`;
 
     const existingSession = await redis.get(sessionStartKey);
     const isFirstPing = !existingSession;
@@ -355,7 +359,7 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
     if (!lastDotRaw) {
       addTrailDot = true;
     } else {
-      const lastDot = JSON.parse(lastDotRaw);
+      const lastDot = JSON.parse(lastDotRaw) as { lat: number; lng: number };
       if (haversineDistance(lastDot.lat, lastDot.lng, finalLat, finalLng) >= TRAIL_MIN_DISTANCE) {
         addTrailDot = true;
       }
@@ -363,7 +367,7 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
 
     const sessionStartedAt = existingSession || now;
     const payload = buildLocationPayload({
-      userId, streamMeta, sessionStartedAt, now, finalLat, finalLng, body: req.body,
+      userId, streamMeta, sessionStartedAt, now, finalLat, finalLng, body,
     });
     payload.h3Cell = h3Cell;
 
@@ -373,31 +377,31 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       h3Cell,
       timestamp: now,
       accuracy: payload.accuracy,
-      speed:    payload.speed,
-      heading:  payload.heading,
-      moving:   payload.moving,
+      speed: payload.speed,
+      heading: payload.heading,
+      moving: payload.moving,
       activity: payload.activity,
-      source:   payload.source,
+      source: payload.source,
       sequence: payload.sequence,
     });
 
-    const sessionMeta = {
+    const sessionMeta: SessionMeta = {
       userId,
-      driverId:    streamMeta.driverId,
-      sessionId:   streamMeta.sessionId,
-      streamKey:   streamMeta.streamKey,
+      driverId: streamMeta.driverId,
+      sessionId: streamMeta.sessionId,
+      streamKey: streamMeta.streamKey,
       rideChannel: streamMeta.rideChannel,
-      roomNames:   streamMeta.roomNames,
-      startedAt:   sessionStartedAt,
+      roomNames: streamMeta.roomNames,
+      startedAt: sessionStartedAt,
       latestTimestamp: now,
-      appState:    payload.appState,
-      source:      payload.source,
+      appState: payload.appState,
+      source: payload.source,
       gpsIntervalMs: payload.gpsIntervalMs,
     };
 
-    const redisOps = [
-      redis.setEx(redisKey,       LOCATION_TTL, JSON.stringify(payload)),
-      redis.setEx(sessionMetaKey, SESSION_TTL,  JSON.stringify(sessionMeta)),
+    const redisOps: Promise<unknown>[] = [
+      redis.setEx(redisKey, LOCATION_TTL, JSON.stringify(payload)),
+      redis.setEx(sessionMetaKey, SESSION_TTL, JSON.stringify(sessionMeta)),
       redis.sAdd(ACTIVE_SET, userId),
     ];
 
@@ -412,22 +416,22 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
           redis.lRange(sessionLogsKey, 0, -1),
         ]);
         if (oldStart && oldLogs && oldLogs.length > 0) {
-          const parsedOldLogs  = oldLogs.map((l) => JSON.parse(l));
+          const parsedOldLogs = oldLogs.map((l) => JSON.parse(l) as { lat: number; lng: number; h3Cell?: string; speed?: number; accuracy?: number; timestamp: string });
           const oldSessionStart = new Date(oldStart);
-          const oldNow          = new Date();
-          const oldDuration     = Math.floor((oldNow - oldSessionStart) / 1000);
+          const oldNow = new Date();
+          const oldDuration = Math.floor((oldNow.getTime() - oldSessionStart.getTime()) / 1000);
 
           const countRes = await pool.query(
             "SELECT COUNT(*) AS cnt FROM sessions WHERE user_id = $1", [userId]
           );
-          const num      = parseInt(countRes.rows[0].cnt, 10) + 1;
-          const oldName  = `session${num}`;
+          const num = parseInt(countRes.rows[0].cnt as string, 10) + 1;
+          const oldName = `session${num}`;
           const firstOld = parsedOldLogs[0];
-          const lastOld  = parsedOldLogs[parsedOldLogs.length - 1];
+          const lastOld = parsedOldLogs[parsedOldLogs.length - 1];
 
           const [startLoc, endLoc] = await Promise.all([
             firstOld ? reverseGeocode(firstOld.lat, firstOld.lng) : null,
-            lastOld  ? reverseGeocode(lastOld.lat,  lastOld.lng)  : null,
+            lastOld ? reverseGeocode(lastOld.lat, lastOld.lng) : null,
           ]);
 
           const sResult = await pool.query(
@@ -435,16 +439,16 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
             [userId, oldName, oldSessionStart, oldNow, oldDuration, parsedOldLogs.length, startLoc, endLoc]
           );
-          const oldSid = sResult.rows[0].id;
+          const oldSid = sResult.rows[0].id as number;
 
           const batchSize = 500;
           for (let b = 0; b < parsedOldLogs.length; b += batchSize) {
-            const batch  = parsedOldLogs.slice(b, b + batchSize);
-            const vals   = [];
-            const params = [];
+            const batch = parsedOldLogs.slice(b, b + batchSize);
+            const vals: string[] = [];
+            const params: (number | string | null)[] = [];
             batch.forEach((point, index) => {
               const offset = index * 7;
-              vals.push(`($${offset+1},$${offset+2},$${offset+3},$${offset+4},$${offset+5},$${offset+6},$${offset+7})`);
+              vals.push(`($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5},$${offset + 6},$${offset + 7})`);
               const speedKmh = typeof point.speed === 'number' ? point.speed * 3.6 : null;
               params.push(oldSid, point.lat, point.lng, point.h3Cell || null, speedKmh, point.accuracy || null, point.timestamp);
             });
@@ -456,7 +460,7 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
           console.log(`[ping] Saved orphan session: ${oldName} | ${parsedOldLogs.length} pts`);
         }
       } catch (e) {
-        console.error("[ping] Failed to save orphan session:", e.message);
+        console.error("[ping] Failed to save orphan session:", (e as Error).message);
       }
 
       redisOps.push(redis.del(sessionLogsKey));
@@ -475,7 +479,6 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       redisOps.push(redis.set(startMarkerKey, startMarker));
       redisOps.push(redis.expire(startMarkerKey, SESSION_TTL));
 
-      // Audit: session_started
       pool.query(
         `INSERT INTO session_events (user_id, event_type, lat, lng, metadata)
          VALUES ($1, $2, $3, $4, $5)`,
@@ -499,29 +502,24 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
 
     // ── Navigation intelligence ───────────────────────────────────────────────
 
-    let deviationAlert  = null;
+    let deviationAlert: DeviationAlert | null = null;
     let arrivalDetected = false;
-    let inactivityFlag  = false;
+    let inactivityFlag = false;
 
     const destRaw = await redis.get(`nav:dest:${userId}`);
     if (destRaw) {
-      const destData = JSON.parse(destRaw);
+      const destData = JSON.parse(destRaw) as DestinationData;
 
-      // Use RAW GPS for safety checks — Kalman filter / snap-to-road can mask
-      // real deviation by pulling coordinates back toward the route.
       const rawLat = lat;
       const rawLng = lng;
 
-      // Arrival check
       arrivalDetected = await checkArrival(userId, rawLat, rawLng, destData, streamMeta, now);
 
       if (!arrivalDetected) {
-        // Deviation check
         deviationAlert = await checkDeviation(userId, rawLat, rawLng, streamMeta, destData);
 
-        // Inactivity check
-        const isMoving  = typeof req.body.moving === "boolean" ? req.body.moving : true;
-        const inactKey  = `inactivity:${userId}`;
+        const isMoving = typeof body.moving === "boolean" ? body.moving : true;
+        const inactKey = `inactivity:${userId}`;
         const distToDest = haversineDistance(
           rawLat, rawLng,
           destData.destination.lat, destData.destination.lng
@@ -532,7 +530,7 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
           if (!inactRaw) {
             await redis.set(inactKey, JSON.stringify({ since: now, lat: finalLat, lng: finalLng }), { EX: SESSION_TTL });
           } else {
-            const inactData = JSON.parse(inactRaw);
+            const inactData = JSON.parse(inactRaw) as { since: string; lat: number; lng: number };
             const stationarySecs = (Date.now() - new Date(inactData.since).getTime()) / 1000;
 
             if (stationarySecs >= INACTIVITY_THRESHOLD_S && distToDest > ARRIVAL_RADIUS_M * 2) {
@@ -554,8 +552,8 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
                 since: inactData.since,
                 destinationName: destData.name || null,
                 timestamp: now,
-                roomNames:  streamMeta.roomNames,
-                streamKey:  streamMeta.streamKey,
+                roomNames: streamMeta.roomNames,
+                streamKey: streamMeta.streamKey,
               }));
             }
           }
@@ -569,14 +567,14 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
     const locReqKey = `locreq:${userId}`;
     let forceRefresh = false;
 
-    if (req.body.source === "force_request") {
+    if (body.source === "force_request") {
       await redis.del(locReqKey);
     } else {
       const pending = await redis.get(locReqKey);
       if (pending) forceRefresh = true;
     }
 
-    return res.status(200).json({
+    res.status(200).json({
       ok: true,
       data: payload,
       forceRefresh,
@@ -585,23 +583,23 @@ router.post("/:id/ping", rateLimitPing, async (req, res) => {
       inactivityFlag,
     });
   } catch (err) {
-    console.error("[POST /:id/ping] Error:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    console.error("[POST /:id/ping] Error:", (err as Error).message);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // ── STOP ──────────────────────────────────────────────────────────────────────
 
-router.post("/:id/stop", async (req, res) => {
+router.post("/:id/stop", async (req: Request, res: Response) => {
   try {
-    const userId = req.params.id;
-    const now    = new Date();
+    const userId = req.params.id as string;
+    const now = new Date();
 
     const sessionStartKey = `session:${userId}:start`;
-    const sessionMetaKey  = `session:${userId}:meta`;
-    const sessionLogsKey  = `session:${userId}:logs`;
-    const trailKey        = `trail:${userId}`;
-    const startMarkerKey  = `marker:${userId}:start`;
+    const sessionMetaKey = `session:${userId}:meta`;
+    const sessionLogsKey = `session:${userId}:logs`;
+    const trailKey = `trail:${userId}`;
+    const startMarkerKey = `marker:${userId}:start`;
 
     const [startedAt, sessionMetaRaw, logs, trailDots, startMarkerRaw] = await Promise.all([
       redis.get(sessionStartKey),
@@ -611,35 +609,36 @@ router.post("/:id/stop", async (req, res) => {
       redis.get(startMarkerKey),
     ]);
 
-    const sessionMeta = sessionMetaRaw ? JSON.parse(sessionMetaRaw) : null;
+    const storedSessionMeta: SessionMeta | null = sessionMetaRaw ? JSON.parse(sessionMetaRaw) : null;
 
     const countResult = await pool.query(
       "SELECT COUNT(*) AS cnt FROM sessions WHERE user_id = $1", [userId]
     );
-    const sessionNumber = parseInt(countResult.rows[0].cnt, 10) + 1;
-    const sessionName   = `session${sessionNumber}`;
+    const sessionNumber = parseInt(countResult.rows[0].cnt as string, 10) + 1;
+    const sessionName = `session${sessionNumber}`;
 
     const sessionStart = startedAt ? new Date(startedAt) : now;
-    const durationSecs = Math.floor((now - sessionStart) / 1000);
-    const parsedLogs   = logs.map((l) => JSON.parse(l));
+    const durationSecs = Math.floor((now.getTime() - sessionStart.getTime()) / 1000);
+    const parsedLogs = logs.map((l) => JSON.parse(l) as {
+      lat: number; lng: number; h3Cell?: string; speed?: number;
+      accuracy?: number; timestamp: string;
+    });
 
     const firstLog = parsedLogs[0];
-    const lastLog  = parsedLogs[parsedLogs.length - 1];
+    const lastLog = parsedLogs[parsedLogs.length - 1];
 
     const [startLocation, endLocation] = await Promise.all([
       firstLog ? reverseGeocode(firstLog.lat, firstLog.lng) : null,
-      lastLog  ? reverseGeocode(lastLog.lat,  lastLog.lng)  : null,
+      lastLog ? reverseGeocode(lastLog.lat, lastLog.lng) : null,
     ]);
 
-    // Read destination/route data from Redis before it gets deleted
     const [destRaw, routeRaw, corridorRaw] = await Promise.all([
       redis.get(`nav:dest:${userId}`),
       redis.get(`nav:route:${userId}`),
       redis.get(`nav:corridor:${userId}`),
     ]);
-    const destInfo = destRaw ? JSON.parse(destRaw) : null;
+    const destInfo: DestinationData | null = destRaw ? JSON.parse(destRaw) : null;
 
-    // Count deviations for this session
     const devCountRes = await pool.query(
       `SELECT COUNT(*) AS cnt FROM deviations WHERE user_id = $1 AND resolved_at IS NULL OR user_id = $1`,
       [userId]
@@ -660,14 +659,13 @@ router.post("/:id/stop", async (req, res) => {
         destInfo?.destination?.lat || null,
         destInfo?.destination?.lng || null,
         destInfo?.name || null,
-        routeRaw || null,           // JSON string of route polyline [{lat,lng},...]
-        corridorRaw || null,        // JSON string of H3 corridor cell array
-        parseInt(devCountRes.rows[0].cnt, 10) || 0,
+        routeRaw || null,
+        corridorRaw || null,
+        parseInt(devCountRes.rows[0].cnt as string, 10) || 0,
       ]
     );
-    const dbSessionId = sessionResult.rows[0].id;
+    const dbSessionId = sessionResult.rows[0].id as number;
 
-    // Diagnostic: log what we're about to insert for the first point
     if (parsedLogs.length > 0) {
       const sample = parsedLogs[0];
       console.log(`[stop] Sample log shape:`, JSON.stringify({
@@ -681,12 +679,12 @@ router.post("/:id/stop", async (req, res) => {
 
     const batchSize = 500;
     for (let b = 0; b < parsedLogs.length; b += batchSize) {
-      const batch  = parsedLogs.slice(b, b + batchSize);
-      const values = [];
-      const params = [];
+      const batch = parsedLogs.slice(b, b + batchSize);
+      const values: string[] = [];
+      const params: (number | string | null)[] = [];
       batch.forEach((point, index) => {
         const offset = index * 7;
-        values.push(`($${offset+1},$${offset+2},$${offset+3},$${offset+4},$${offset+5},$${offset+6},$${offset+7})`);
+        values.push(`($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5},$${offset + 6},$${offset + 7})`);
         const speedKmh = typeof point.speed === 'number' ? point.speed * 3.6 : null;
         const accuracyVal = typeof point.accuracy === 'number' ? point.accuracy : null;
         params.push(dbSessionId, point.lat, point.lng, point.h3Cell || null, speedKmh, accuracyVal, point.timestamp);
@@ -699,7 +697,6 @@ router.post("/:id/stop", async (req, res) => {
 
     console.log(`[stop] ${sessionName} | ${parsedLogs.length} pts | ${durationSecs}s`);
 
-    // Audit: session_ended
     const lastPt = parsedLogs[parsedLogs.length - 1];
     pool.query(
       `INSERT INTO session_events (session_id, user_id, event_type, lat, lng, metadata)
@@ -709,24 +706,24 @@ router.post("/:id/stop", async (req, res) => {
 
     clearUserState(userId);
 
-    const finalLog   = parsedLogs[parsedLogs.length - 1];
+    const finalLog = parsedLogs[parsedLogs.length - 1];
     const stopMarker = finalLog ? { lat: finalLog.lat, lng: finalLog.lng } : null;
-    const startMarker = startMarkerRaw ? JSON.parse(startMarkerRaw) : null;
-    const rawTrail   = trailDots.map((d) => JSON.parse(d));
+    const startMarker = startMarkerRaw ? JSON.parse(startMarkerRaw) as { lat: number; lng: number } : null;
+    const rawTrail = trailDots.map((d) => JSON.parse(d) as { lat: number; lng: number; timestamp?: string });
     const parsedTrail = rawTrail.length >= 2 ? await snapTrajectory(rawTrail) : rawTrail;
 
     const stopPayload = {
-      event:       "tracking_stopped",
-      stopped:     true,
+      event: "tracking_stopped",
+      stopped: true,
       userId,
-      driverId:    sessionMeta?.driverId    || userId,
-      sessionId:   sessionMeta?.sessionId   || null,
-      streamKey:   sessionMeta?.streamKey   || `stream:${userId}:live`,
-      rideChannel: sessionMeta?.rideChannel || null,
-      roomNames:   sessionMeta?.roomNames   || [],
-      timestamp:   now.toISOString(),
-      endedAt:     now.toISOString(),
-      totalPings:  parsedLogs.length,
+      driverId: storedSessionMeta?.driverId || userId,
+      sessionId: storedSessionMeta?.sessionId || null,
+      streamKey: storedSessionMeta?.streamKey || `stream:${userId}:live`,
+      rideChannel: storedSessionMeta?.rideChannel || null,
+      roomNames: storedSessionMeta?.roomNames || [],
+      timestamp: now.toISOString(),
+      endedAt: now.toISOString(),
+      totalPings: parsedLogs.length,
       durationSecs,
     };
 
@@ -743,33 +740,33 @@ router.post("/:id/stop", async (req, res) => {
       redis.del(`nav:outer:${userId}`),
       redis.del(`nav:route:${userId}`),
       redis.del(`deviation:${userId}`),
-      redis.del(`devstreak:${userId}`),   // FIX: clean up Redis streak on stop
+      redis.del(`devstreak:${userId}`),
       redis.sRem(ACTIVE_SET, userId),
       redis.publish(CHANNEL, JSON.stringify(stopPayload)),
     ]);
 
-    return res.status(200).json({
+    res.status(200).json({
       ok: true,
       session: {
-        id:           dbSessionId,
-        name:         sessionName,
+        id: dbSessionId,
+        name: sessionName,
         userId,
-        startedAt:    sessionStart,
-        endedAt:      now,
+        startedAt: sessionStart,
+        endedAt: now,
         durationSecs,
-        totalPings:   parsedLogs.length,
+        totalPings: parsedLogs.length,
         startLocation,
         endLocation,
         startMarker,
         stopMarker,
-        trail:        parsedTrail,
-        stream:       sessionMeta,
+        trail: parsedTrail,
+        stream: storedSessionMeta,
       },
     });
   } catch (err) {
-    console.error("[POST /:id/stop] Error:", err.message);
-    return res.status(500).json({ error: "Internal server error" });
+    console.error("[POST /:id/stop] Error:", (err as Error).message);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-module.exports = router;
+export default router;

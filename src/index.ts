@@ -1,14 +1,14 @@
-require("dotenv").config();
+import "dotenv/config";
 
-const http = require("http");
-const express = require("express");
-const cors = require("cors");
+import http from "http";
+import express from "express";
+import cors from "cors";
 
-const { connectRedis, redis } = require("./redis");
-const { connectDB } = require("./db");
-const { initSocket } = require("./socket");
-const { initGpsState } = require("./utils/gps");
-const routes = require("./routes");
+import { connectRedis, redis } from "./redis";
+import { connectDB } from "./db";
+import { initSocket } from "./socket";
+import { initGpsState } from "./utils/gps";
+import routes from "./routes";
 
 const app = express();
 const PORT = process.env.PORT || 9001;
@@ -35,7 +35,7 @@ app.use("/", routes);
 
 // ── Server bootstrap ────────────────────────────────────────────────
 
-async function start() {
+async function start(): Promise<void> {
   await connectRedis();
   await connectDB();
 
@@ -51,17 +51,14 @@ async function start() {
     console.log("  Scaling: Redis adapter ✓ | Rate limiter ✓");
     console.log("═══════════════════════════════════════════════════");
 
-    // FIX: Self-ping must use the public Railway URL, not localhost.
-    // localhost only pings the process internally and does NOT prevent
-    // Railway from sleeping the instance after inactivity.
     const PUBLIC_URL = process.env.PUBLIC_URL ||
       "https://livetracker-production-e412.up.railway.app";
 
     setInterval(() => {
       fetch(`${PUBLIC_URL}/health`)
         .then(() => console.log("[keepalive] ping ok"))
-        .catch((err) => console.warn("[keepalive] ping failed:", err.message));
-    }, 13 * 60 * 1000); // every 13 minutes
+        .catch((err: Error) => console.warn("[keepalive] ping failed:", err.message));
+    }, 13 * 60 * 1000);
   });
 
   process.on("SIGINT", () => {
@@ -75,7 +72,7 @@ async function start() {
   });
 }
 
-start().catch((err) => {
+start().catch((err: unknown) => {
   console.error("[Server] Failed to start:", err);
   process.exit(1);
 });

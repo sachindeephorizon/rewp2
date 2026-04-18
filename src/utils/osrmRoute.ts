@@ -1,17 +1,26 @@
-"use strict";
+import type { LatLng, OsrmRouteResult } from "../types";
 
 const OSRM_URL = "https://router.project-osrm.org/route/v1/driving";
 const ROUTE_TIMEOUT_MS = 8000;
 
+interface OsrmResponse {
+  code: string;
+  routes?: Array<{
+    geometry: string;
+    distance: number;
+    duration: number;
+  }>;
+}
+
 /**
- * Decode a Google-encoded polyline string into [[lat, lng], ...].
+ * Decode a Google-encoded polyline string into [{lat, lng}, ...].
  */
-function decodePolyline(str, precision = 5) {
+export function decodePolyline(str: string, precision = 5): LatLng[] {
   const factor = Math.pow(10, precision);
   let index = 0, lat = 0, lng = 0;
-  const coords = [];
+  const coords: LatLng[] = [];
   while (index < str.length) {
-    let result = 0, shift = 0, b;
+    let result = 0, shift = 0, b: number;
     do { b = str.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
     lat += result & 1 ? ~(result >> 1) : result >> 1;
     result = 0; shift = 0;
@@ -24,18 +33,15 @@ function decodePolyline(str, precision = 5) {
 
 /**
  * Fetch a driving route from OSRM.
- * @param {{lat:number,lng:number}} origin
- * @param {{lat:number,lng:number}} destination
- * @returns {Promise<{route: Array<{lat,lng}>, distance: number, duration: number}>}
  */
-async function fetchOsrmRoute(origin, destination) {
+export async function fetchOsrmRoute(origin: LatLng, destination: LatLng): Promise<OsrmRouteResult> {
   const url = `${OSRM_URL}/${origin.lng},${origin.lat};${destination.lng},${destination.lat}?overview=full&geometries=polyline`;
   const res = await fetch(url, {
     headers: { Accept: "application/json" },
     signal: AbortSignal.timeout(ROUTE_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`OSRM ${res.status}`);
-  const data = await res.json();
+  const data = await res.json() as OsrmResponse;
   if (data.code !== "Ok" || !data.routes?.length) {
     throw new Error(`OSRM: ${data.code || "no route"}`);
   }
@@ -46,5 +52,3 @@ async function fetchOsrmRoute(origin, destination) {
     duration: best.duration,
   };
 }
-
-module.exports = { fetchOsrmRoute, decodePolyline };

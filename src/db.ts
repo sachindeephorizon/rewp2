@@ -1,39 +1,20 @@
-const { Pool } = require("pg");
+import { Pool } from "pg";
 
 /**
  * FIX: Configured pool properly for long sessions (10hr+).
- *
- * Without these settings, 1s pings exhaust Postgres connections within hours:
- *
- * max: 10          — Render free Postgres allows 25 total connections.
- *                    With cluster workers each needing a pool, cap at 10
- *                    per worker to stay safely under the limit.
- *
- * idleTimeoutMillis: 30000  — Close idle connections after 30s.
- *                             Without this, connections stay open forever
- *                             and you hit the 25-connection cap within hours.
- *
- * connectionTimeoutMillis: 5000 — If a connection can't be acquired in 5s,
- *                                  fail fast with an error instead of hanging
- *                                  the request indefinitely.
- *
- * allowExitOnIdle: true  — Allow the process to exit cleanly when all
- *                          connections are idle (important for graceful shutdown).
  */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 10,                      // FIX: was unlimited — exhausts Render's 25-connection cap
-  idleTimeoutMillis: 30000,     // FIX: was never set — connections leaked forever
-  connectionTimeoutMillis: 5000, // FIX: was never set — hung requests on DB overload
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
   allowExitOnIdle: true,
 });
 
-pool.on("error", (err) => console.error("[Postgres] Pool error:", err.message));
+pool.on("error", (err: Error) => console.error("[Postgres] Pool error:", err.message));
 
 // ── Pool health monitoring for long sessions ──────────────────────
-// Logs pool stats every 5 minutes so you can see connection usage on Render logs.
-// Helps diagnose connection leaks during long tracking sessions.
 setInterval(() => {
   console.log(
     `[Postgres] Pool stats | total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount}`
@@ -42,12 +23,8 @@ setInterval(() => {
 
 /**
  * Connect to PostgreSQL and create tables if they don't exist.
- *
- * Schema:
- *   sessions       — one row per tracking session (userId + start/end time)
- *   location_logs  — every location ping recorded during a session
  */
-async function connectDB() {
+async function connectDB(): Promise<void> {
   try {
     const client = await pool.connect();
     console.log("[Postgres] Connected");
@@ -65,8 +42,7 @@ async function connectDB() {
       );
 
       -- ═══════════════════════════════════════════════════════════════
-      -- SESSIONS — one row per completed monitoring session
-      -- Matches PDF spec Section 4: monitoring_sessions
+      -- SESSIONS
       -- ═══════════════════════════════════════════════════════════════
       CREATE TABLE IF NOT EXISTS sessions (
         id              SERIAL PRIMARY KEY,
@@ -80,22 +56,18 @@ async function connectDB() {
         total_pings     INTEGER NOT NULL DEFAULT 0,
         start_location  VARCHAR(255),
         end_location    VARCHAR(255),
-        -- Origin / destination (plain lat/lng — PostGIS upgrade later)
         origin_lat      DOUBLE PRECISION,
         origin_lng      DOUBLE PRECISION,
         dest_lat        DOUBLE PRECISION,
         dest_lng        DOUBLE PRECISION,
         dest_label      TEXT,
-        -- Route (stored as JSON text — PostGIS LINESTRING upgrade later)
         route_polyline   TEXT,
         route_h3_corridor TEXT,
-        -- Stats
         total_distance_m DOUBLE PRECISION DEFAULT 0,
         deviation_count  INTEGER DEFAULT 0,
         created_at      TIMESTAMPTZ DEFAULT NOW()
       );
 
-      -- Migrations for existing sessions table
       ALTER TABLE sessions ADD COLUMN IF NOT EXISTS start_location VARCHAR(255);
       ALTER TABLE sessions ADD COLUMN IF NOT EXISTS end_location VARCHAR(255);
       ALTER TABLE sessions ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
@@ -114,8 +86,7 @@ async function connectDB() {
       CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 
       -- ═══════════════════════════════════════════════════════════════
-      -- LOCATION_LOGS — every GPS ping stored after session ends
-      -- Matches PDF spec: session_location_history
+      -- LOCATION_LOGS
       -- ═══════════════════════════════════════════════════════════════
       CREATE TABLE IF NOT EXISTS location_logs (
         id              SERIAL PRIMARY KEY,
@@ -130,7 +101,6 @@ async function connectDB() {
         recorded_at     TIMESTAMPTZ NOT NULL
       );
 
-      -- Migrations for existing location_logs table
       ALTER TABLE location_logs ADD COLUMN IF NOT EXISTS h3_cell VARCHAR(20);
       ALTER TABLE location_logs ADD COLUMN IF NOT EXISTS speed_kmh DOUBLE PRECISION;
       ALTER TABLE location_logs ADD COLUMN IF NOT EXISTS accuracy_m DOUBLE PRECISION;
@@ -144,7 +114,7 @@ async function connectDB() {
         ON location_logs(session_id, recorded_at ASC);
 
       -- ═══════════════════════════════════════════════════════════════
-      -- DEVIATIONS — route deviation events
+      -- DEVIATIONS
       -- ═══════════════════════════════════════════════════════════════
       CREATE TABLE IF NOT EXISTS deviations (
         id                  SERIAL PRIMARY KEY,
@@ -166,19 +136,13 @@ async function connectDB() {
       CREATE INDEX IF NOT EXISTS idx_deviations_detected_at ON deviations(detected_at);
 
       -- ═══════════════════════════════════════════════════════════════
-      -- SESSION_EVENTS — full audit trail (PDF spec Section 4)
-      -- Every check-in, deviation, escalation, arrival logged here
+      -- SESSION_EVENTS
       -- ═══════════════════════════════════════════════════════════════
       CREATE TABLE IF NOT EXISTS session_events (
         id          BIGSERIAL PRIMARY KEY,
         session_id  INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
         user_id     VARCHAR(100) NOT NULL,
         event_type  TEXT NOT NULL,
-        -- Types: session_started | session_ended |
-        --        deviation_detected | deviation_cleared |
-        --        inactivity_detected |
-        --        arrival_detected |
-        --        destination_set | destination_cleared
         occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         lat         DOUBLE PRECISION,
         lng         DOUBLE PRECISION,
@@ -192,8 +156,7 @@ async function connectDB() {
       CREATE INDEX IF NOT EXISTS idx_events_user ON session_events(user_id);
 
       -- ═══════════════════════════════════════════════════════════════
-      -- H3_RISK_SCORES — zone-level risk intelligence (PDF Section 4)
-      -- Accumulates over time from session data. All 0.0 at launch.
+      -- H3_RISK_SCORES
       -- ═══════════════════════════════════════════════════════════════
       CREATE TABLE IF NOT EXISTS h3_risk_scores (
         h3_cell             VARCHAR(20) PRIMARY KEY,
@@ -214,9 +177,9 @@ async function connectDB() {
     client.release();
     console.log("[Postgres] Tables ready");
   } catch (err) {
-    console.error("[Postgres] Failed to connect:", err.message);
+    console.error("[Postgres] Failed to connect:", (err as Error).message);
     process.exit(1);
   }
 }
 
-module.exports = { pool, connectDB };
+export { pool, connectDB };
