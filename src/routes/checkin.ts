@@ -6,16 +6,16 @@ const router: Router = express.Router();
 const LOCATION_SERVICE_URL = process.env.LOCATION_SERVICE_URL || 'http://localhost:3001';
 
 // ── Tier config ──
-// Tier 1 (Passive):   smooth trip, check every 30 min
-// Tier 2 (Active):    inactivity detected, check every 10 min
-// Tier 3 (Emergency): missed check-in, check every 5 min
-const TIER_CONFIG = {
+// Tier 1 (Passive):   smooth trip, check every 30 min — cell-tower / low-power
+// Tier 2 (Active):    short deviation OR inactivity, check every 15 min — balanced GPS
+// Tier 3 (Emergency): long deviation OR missed check-in, every 5 min — full GPS
+export const TIER_CONFIG = {
   1: { name: 'passive',   interval_minutes: 30, countdown_seconds: 30 },
-  2: { name: 'active',    interval_minutes: 10, countdown_seconds: 30 },
+  2: { name: 'active',    interval_minutes: 15, countdown_seconds: 30 },
   3: { name: 'emergency', interval_minutes: 5,  countdown_seconds: 30 }
 } as const;
 
-type Tier = 1 | 2 | 3;
+export type Tier = 1 | 2 | 3;
 
 interface CheckinSession {
   user_id: string;
@@ -40,7 +40,7 @@ function calcNextCheckin(intervalMin: number): string {
 }
 
 // Helper: shift tier and notify location service
-async function shiftTier(session: CheckinSession, newTier: Tier, reason: string) {
+export async function shiftTier(session: CheckinSession, newTier: Tier, reason: string) {
   session.tier = newTier;
   session.interval_minutes = TIER_CONFIG[newTier].interval_minutes;
   session.next_checkin_at = calcNextCheckin(session.interval_minutes);
@@ -345,5 +345,87 @@ router.put('/checkin/:user_id/stop', (req: Request<{ user_id: string }>, res: Re
     timestamp: new Date().toISOString()
   });
 });
+
+// ── Internal helpers used by tracking.ts (no HTTP round-trip) ──────────────
+
+/**
+ * Lazily create a check-in session if one doesn't already exist for this user.
+ * Used by the tracking pipeline so a tier shift never silently no-ops on a
+ * user who started monitoring without explicitly hitting /checkin/start.
+ */
+function ensureCheckinSession(userId: string): CheckinSession {
+  const existing = checkinStore[userId];
+  if (existing && existing.active) return existing;
+  const fresh: CheckinSession = {
+    user_id: userId,
+    tier: 1,
+    interval_minutes: TIER_CONFIG[1].interval_minutes,
+    countdown_seconds: TIER_CONFIG[1].countdown_seconds,
+    last_checkin_at: null,
+    next_checkin_at: calcNextCheckin(TIER_CONFIG[1].interval_minutes),
+    last_response: 'pending',
+    checkin_count: 0,
+    missed_count: 0,
+    active: true,
+    tier_history: [
+      { tier: 1, tier_name: 'passive', reason: 'auto_created_by_tracking', at: new Date().toISOString() },
+    ],
+  };
+  checkinStore[userId] = fresh;
+  return fresh;
+}
+
+/**
+ * Bump tier when the location pipeline observes a stationary user.
+ * Tier 1 → Tier 2. Idempotent for users already at T2/T3.
+ */
+export async function escalateOnInactivity(userId: string): Promise<Tier> {
+  const session = ensureCheckinSession(userId);
+  if (session.tier === 1) {
+    await shiftTier(session, 2, 'inactivity_detected');
+  }
+  return session.tier;
+}
+
+/**
+ * Bump tier on a route deviation. severity drives the target tier:
+ *   short → at least Tier 2
+ *   long  → Tier 3
+ */
+export async function escalateOnDeviation(
+  userId: string,
+  severity: 'short' | 'long',
+): Promise<Tier> {
+  const session = ensureCheckinSession(userId);
+  const target: Tier = severity === 'long' ? 3 : 2;
+  if (session.tier < target) {
+    await shiftTier(
+      session,
+      target,
+      severity === 'long' ? 'long_route_deviation' : 'short_route_deviation',
+    );
+  }
+  return session.tier;
+}
+
+/**
+ * Read tier + next_checkin_at for the ping response. Returns null if the user
+ * has no check-in session yet (tracking can still ping pre-tier).
+ */
+export function getCheckinSnapshot(userId: string): {
+  tier: Tier;
+  tier_name: string;
+  interval_minutes: number;
+  next_checkin_at: string | null;
+} | null {
+  const s = checkinStore[userId];
+  if (!s || !s.active) return null;
+  return {
+    tier: s.tier,
+    tier_name: TIER_CONFIG[s.tier].name,
+    interval_minutes: s.interval_minutes,
+    next_checkin_at: s.next_checkin_at,
+  };
+}
 
 export default router;

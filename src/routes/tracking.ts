@@ -23,6 +23,11 @@ import {
 } from "../config";
 import { buildStreamMetadata } from "../utils/stream";
 import type { StreamMetadata, DestinationData, DeviationAlert, LocationPayload, PingBody, SessionMeta } from "../types";
+import {
+  escalateOnInactivity,
+  escalateOnDeviation,
+  getCheckinSnapshot,
+} from "./checkin";
 
 const router = Router();
 
@@ -139,50 +144,128 @@ async function checkDeviation(
 
   console.log(`[deviation] ${userId} OUTSIDE corridor | streak=${newCount}`);
 
-  if (newCount >= 3) {
-    const alert: DeviationAlert = {
-      userId,
-      lat,
-      lng,
-      h3Cell: devCell,
-      zone: "OUTSIDE",
-      consecutive: newCount,
-      destinationName: destData.name || null,
-      detectedAt: new Date().toISOString(),
-    };
+  // Fire only on threshold crossings (one event per severity escalation),
+  // not on every consecutive ping.
+  let severity: 'short' | 'long' | null = null;
+  if (newCount === SHORT_DEV_STREAK) severity = 'short';
+  else if (newCount === LONG_DEV_STREAK) severity = 'long';
+  if (!severity) return null;
 
-    await redis.set(`deviation:${userId}`, JSON.stringify(alert), { EX: SESSION_TTL });
+  const alert: DeviationAlert = {
+    userId,
+    lat,
+    lng,
+    h3Cell: devCell,
+    zone: severity === 'long' ? 'OUTSIDE_LONG' : 'OUTSIDE_SHORT',
+    consecutive: newCount,
+    destinationName: destData.name || null,
+    detectedAt: new Date().toISOString(),
+    // ts-expect-error keep DeviationAlert type loose; clients also read severity
+    severity,
+  } as DeviationAlert & { severity: 'short' | 'long' };
 
-    await redis.publish(CHANNEL, JSON.stringify({
-      event: "deviation_alert",
-      ...alert,
-      roomNames: streamMeta.roomNames,
-      streamKey: streamMeta.streamKey,
-    }));
+  await redis.set(`deviation:${userId}`, JSON.stringify(alert), { EX: SESSION_TTL });
 
-    pool.query(
-      `INSERT INTO deviations (user_id, lat, lng, h3_cell, zone, consecutive, destination_name)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [userId, lat, lng, devCell, "OUTSIDE", newCount, destData.name || null]
-    ).catch((e: Error) => console.error("[deviation] DB insert failed:", e.message));
+  await redis.publish(CHANNEL, JSON.stringify({
+    event: "deviation_alert",
+    ...alert,
+    roomNames: streamMeta.roomNames,
+    streamKey: streamMeta.streamKey,
+  }));
 
-    pool.query(
-      `INSERT INTO session_events (user_id, event_type, lat, lng, h3_cell, metadata)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [userId, 'deviation_detected', lat, lng, devCell, JSON.stringify({ zone: 'OUTSIDE', consecutive: newCount, destinationName: destData.name })]
-    ).catch(() => {});
+  pool.query(
+    `INSERT INTO deviations (user_id, lat, lng, h3_cell, zone, consecutive, destination_name)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [userId, lat, lng, devCell, alert.zone, newCount, destData.name || null]
+  ).catch((e: Error) => console.error("[deviation] DB insert failed:", e.message));
 
-    console.log(`[deviation] 🚨 ${userId} alert fired | streak=${newCount}`);
-    return alert;
-  }
+  pool.query(
+    `INSERT INTO session_events (user_id, event_type, lat, lng, h3_cell, metadata)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [userId, 'deviation_detected', lat, lng, devCell, JSON.stringify({ severity, consecutive: newCount, destinationName: destData.name })]
+  ).catch(() => {});
 
-  return null;
+  // Bump check-in tier in-process (no HTTP round trip).
+  escalateOnDeviation(userId, severity).catch((e: Error) =>
+    console.error('[deviation] escalateOnDeviation failed:', e.message)
+  );
+
+  console.log(`[deviation] 🚨 ${userId} ${severity.toUpperCase()} alert | streak=${newCount}`);
+  return alert;
 }
+
+// ── Deviation classification thresholds ──────────────────────────────────────
+// Streak counts of consecutive pings outside the H3 corridor.
+//   3..7   → "short"  → bump check-in tier to T2
+//   ≥ 8    → "long"   → bump check-in tier to T3
+const SHORT_DEV_STREAK = 3;
+const LONG_DEV_STREAK = 8;
 
 // ── Arrival check ────────────────────────────────────────────────────────────
 
 const ARRIVAL_RADIUS_M = 200;
-const INACTIVITY_THRESHOLD_S = 900; // 15 minutes
+
+// ── Inactivity (distance-window) ─────────────────────────────────────────────
+// Per PRD: distance covered in the last 10 min < 30 m AND not near destination.
+const INACTIVITY_WINDOW_S = 600;          // 10 minutes
+const INACTIVITY_DISTANCE_M = 30;         // total displacement threshold
+const INACTIVITY_NEAR_DEST_M = ARRIVAL_RADIUS_M * 2; // suppress when ≈ at destination
+
+interface InactivitySample {
+  t: number;   // epoch ms
+  lat: number;
+  lng: number;
+}
+
+async function pushInactivitySample(userId: string, sample: InactivitySample): Promise<void> {
+  const key = `inactwin:${userId}`;
+  await redis.rPush(key, JSON.stringify(sample));
+  await redis.expire(key, SESSION_TTL);
+  // Trim anything older than the window from the head (cheap when window is short).
+  const cutoff = Date.now() - INACTIVITY_WINDOW_S * 1000;
+  const head = await redis.lRange(key, 0, 0);
+  if (head.length > 0) {
+    try {
+      const first = JSON.parse(head[0]) as InactivitySample;
+      if (first.t < cutoff) {
+        const all = await redis.lRange(key, 0, -1);
+        const kept = all
+          .map((s) => JSON.parse(s) as InactivitySample)
+          .filter((s) => s.t >= cutoff)
+          .map((s) => JSON.stringify(s));
+        await redis.del(key);
+        if (kept.length > 0) {
+          await redis.rPush(key, kept);
+          await redis.expire(key, SESSION_TTL);
+        }
+      }
+    } catch {
+      // best-effort
+    }
+  }
+}
+
+async function getWindowDisplacement(userId: string): Promise<{ samples: number; maxDisplacementM: number; spanS: number }> {
+  const raw = await redis.lRange(`inactwin:${userId}`, 0, -1);
+  if (raw.length < 2) return { samples: raw.length, maxDisplacementM: 0, spanS: 0 };
+  const samples: InactivitySample[] = raw.map((s) => JSON.parse(s));
+  // Use the *anchor* (oldest) point and check displacement of every other
+  // sample from it. Max-displacement matches the user spec — we want to know
+  // if the user has moved AT ALL in the window, not just the cumulative
+  // jitter from GPS noise.
+  const anchor = samples[0];
+  let max = 0;
+  for (let i = 1; i < samples.length; i++) {
+    const d = haversineDistance(anchor.lat, anchor.lng, samples[i].lat, samples[i].lng);
+    if (d > max) max = d;
+  }
+  const spanS = (samples[samples.length - 1].t - anchor.t) / 1000;
+  return { samples: samples.length, maxDisplacementM: max, spanS };
+}
+
+async function clearInactivityWindow(userId: string): Promise<void> {
+  await redis.del(`inactwin:${userId}`);
+}
 
 async function checkArrival(
   userId: string,
@@ -212,6 +295,7 @@ async function checkArrival(
     redis.del(`deviation:${userId}`),
     redis.del(`devstreak:${userId}`),
     redis.del(`inactivity:${userId}`),
+    redis.del(`inactwin:${userId}`),
   ]);
 
   await redis.publish(CHANNEL, JSON.stringify({
@@ -305,6 +389,7 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
       }
 
       const pendingReq = await redis.get(`locreq:${userId}`);
+      const tierSnap = getCheckinSnapshot(userId);
 
       res.status(200).json({
         ok: true,
@@ -317,6 +402,10 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
         forceRefresh: !!pendingReq,
         deviationAlert: filteredDevAlert,
         arrivalDetected: filteredArrival,
+        tier: tierSnap?.tier ?? null,
+        tierName: tierSnap?.tier_name ?? null,
+        intervalMinutes: tierSnap?.interval_minutes ?? null,
+        nextCheckinAt: tierSnap?.next_checkin_at ?? null,
       });
       return;
     }
@@ -518,48 +607,65 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
       if (!arrivalDetected) {
         deviationAlert = await checkDeviation(userId, rawLat, rawLng, streamMeta, destData);
 
-        const isMoving = typeof body.moving === "boolean" ? body.moving : true;
-        const inactKey = `inactivity:${userId}`;
+        // Distance-window inactivity:
+        //   distance covered in last 10 min < 30 m AND not near destination.
         const distToDest = haversineDistance(
           rawLat, rawLng,
           destData.destination.lat, destData.destination.lng
         );
+        const nearDest = distToDest <= INACTIVITY_NEAR_DEST_M;
 
-        if (!isMoving) {
-          const inactRaw = await redis.get(inactKey);
-          if (!inactRaw) {
-            await redis.set(inactKey, JSON.stringify({ since: now, lat: finalLat, lng: finalLng }), { EX: SESSION_TTL });
-          } else {
-            const inactData = JSON.parse(inactRaw) as { since: string; lat: number; lng: number };
-            const stationarySecs = (Date.now() - new Date(inactData.since).getTime()) / 1000;
-
-            if (stationarySecs >= INACTIVITY_THRESHOLD_S && distToDest > ARRIVAL_RADIUS_M * 2) {
-              inactivityFlag = true;
-              console.log(`[inactivity] ⚠️ ${userId} stationary ${Math.round(stationarySecs)}s`);
-
-              pool.query(
-                `INSERT INTO session_events (user_id, event_type, lat, lng, metadata)
-                 VALUES ($1, $2, $3, $4, $5)`,
-                [userId, 'inactivity_detected', finalLat, finalLng, JSON.stringify({ stationarySecs: Math.round(stationarySecs), since: inactData.since })]
-              ).catch(() => {});
-
-              await redis.publish(CHANNEL, JSON.stringify({
-                event: "inactivity_alert",
-                userId,
-                lat: finalLat,
-                lng: finalLng,
-                stationarySecs: Math.round(stationarySecs),
-                since: inactData.since,
-                destinationName: destData.name || null,
-                timestamp: now,
-                roomNames: streamMeta.roomNames,
-                streamKey: streamMeta.streamKey,
-              }));
-            }
-          }
+        if (nearDest) {
+          await clearInactivityWindow(userId);
         } else {
-          await redis.del(inactKey);
+          await pushInactivitySample(userId, { t: Date.now(), lat: finalLat, lng: finalLng });
+          const win = await getWindowDisplacement(userId);
+          if (win.spanS >= INACTIVITY_WINDOW_S && win.maxDisplacementM < INACTIVITY_DISTANCE_M) {
+            inactivityFlag = true;
+            console.log(`[inactivity] ⚠️ ${userId} <${INACTIVITY_DISTANCE_M}m in ${Math.round(win.spanS)}s (${win.samples} samples)`);
+
+            pool.query(
+              `INSERT INTO session_events (user_id, event_type, lat, lng, metadata)
+               VALUES ($1, $2, $3, $4, $5)`,
+              [userId, 'inactivity_detected', finalLat, finalLng, JSON.stringify({
+                windowSecs: Math.round(win.spanS),
+                maxDisplacementM: Math.round(win.maxDisplacementM),
+                samples: win.samples,
+              })]
+            ).catch(() => {});
+
+            await redis.publish(CHANNEL, JSON.stringify({
+              event: "inactivity_alert",
+              userId,
+              lat: finalLat,
+              lng: finalLng,
+              windowSecs: Math.round(win.spanS),
+              maxDisplacementM: Math.round(win.maxDisplacementM),
+              destinationName: destData.name || null,
+              timestamp: now,
+              roomNames: streamMeta.roomNames,
+              streamKey: streamMeta.streamKey,
+            }));
+
+            // Bump check-in tier (T1 → T2). Idempotent if already at T2/T3.
+            escalateOnInactivity(userId).catch((e: Error) =>
+              console.error('[inactivity] escalateOnInactivity failed:', e.message)
+            );
+
+            // Reset the window so we don't keep re-firing every ping.
+            await clearInactivityWindow(userId);
+          }
         }
+      }
+    } else {
+      // No destination set — still track inactivity (bearing-only sessions),
+      // but skip the near-destination guard.
+      await pushInactivitySample(userId, { t: Date.now(), lat: finalLat, lng: finalLng });
+      const win = await getWindowDisplacement(userId);
+      if (win.spanS >= INACTIVITY_WINDOW_S && win.maxDisplacementM < INACTIVITY_DISTANCE_M) {
+        inactivityFlag = true;
+        escalateOnInactivity(userId).catch(() => {});
+        await clearInactivityWindow(userId);
       }
     }
 
@@ -574,6 +680,8 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
       if (pending) forceRefresh = true;
     }
 
+    const tierSnap = getCheckinSnapshot(userId);
+
     res.status(200).json({
       ok: true,
       data: payload,
@@ -581,6 +689,10 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
       deviationAlert,
       arrivalDetected,
       inactivityFlag,
+      tier: tierSnap?.tier ?? null,
+      tierName: tierSnap?.tier_name ?? null,
+      intervalMinutes: tierSnap?.interval_minutes ?? null,
+      nextCheckinAt: tierSnap?.next_checkin_at ?? null,
     });
   } catch (err) {
     console.error("[POST /:id/ping] Error:", (err as Error).message);
