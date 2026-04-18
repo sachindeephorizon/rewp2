@@ -1,6 +1,6 @@
 import express, { Router, Request, Response } from 'express';
 import { sessionStore } from './entry';
-import { checkinStore } from './checkin';
+import { checkinStore, TIER_CONFIG } from './checkin';
 
 const router: Router = express.Router();
 
@@ -191,7 +191,7 @@ router.put('/escalation/:user_id/safe', async (req: Request<{ user_id: string }>
   const checkin = checkinStore[user_id];
   if (checkin && checkin.active) {
     checkin.tier = 1;
-    checkin.interval_minutes = 30;
+    checkin.interval_minutes = TIER_CONFIG[1].interval_minutes;
     checkin.missed_count = 0;
     checkin.last_response = 'safe';
     checkin.tier_history.push({

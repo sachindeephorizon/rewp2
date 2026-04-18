@@ -10,9 +10,9 @@ const LOCATION_SERVICE_URL = process.env.LOCATION_SERVICE_URL || 'http://localho
 // Tier 2 (Active):    short deviation OR inactivity, check every 15 min — balanced GPS
 // Tier 3 (Emergency): long deviation OR missed check-in, every 5 min — full GPS
 export const TIER_CONFIG = {
-  1: { name: 'passive',   interval_minutes: 1, countdown_seconds: 30 },  // TESTING: was 30
-  2: { name: 'active',    interval_minutes: 15, countdown_seconds: 30 },
-  3: { name: 'emergency', interval_minutes: 5,  countdown_seconds: 30 }
+  1: { name: 'passive',   interval_minutes: 1, countdown_seconds: 30 },
+  2: { name: 'active',    interval_minutes: 1, countdown_seconds: 30 },
+  3: { name: 'emergency', interval_minutes: 1, countdown_seconds: 30 },
 } as const;
 
 export type Tier = 1 | 2 | 3;
@@ -101,8 +101,8 @@ router.post('/checkin/:user_id/start', (req: Request<{ user_id: string }>, res: 
     user_id,
     tier: 1,
     tier_name: 'passive',
-    interval_minutes: 30,
-    countdown_seconds: 30,
+    interval_minutes: TIER_CONFIG[1].interval_minutes,
+    countdown_seconds: TIER_CONFIG[1].countdown_seconds,
     next_checkin_at: checkinStore[user_id].next_checkin_at,
     message: 'Check-in cycle started at Tier 1 (passive)',
     timestamp: new Date().toISOString()
