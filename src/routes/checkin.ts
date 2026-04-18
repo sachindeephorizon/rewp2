@@ -10,7 +10,7 @@ const LOCATION_SERVICE_URL = process.env.LOCATION_SERVICE_URL || 'http://localho
 // Tier 2 (Active):    short deviation OR inactivity, check every 15 min — balanced GPS
 // Tier 3 (Emergency): long deviation OR missed check-in, every 5 min — full GPS
 export const TIER_CONFIG = {
-  1: { name: 'passive',   interval_minutes: 30, countdown_seconds: 30 },
+  1: { name: 'passive',   interval_minutes: 1, countdown_seconds: 30 },  // TESTING: was 30
   2: { name: 'active',    interval_minutes: 15, countdown_seconds: 30 },
   3: { name: 'emergency', interval_minutes: 5,  countdown_seconds: 30 }
 } as const;
@@ -409,17 +409,17 @@ export async function escalateOnDeviation(
 }
 
 /**
- * Read tier + next_checkin_at for the ping response. Returns null if the user
- * has no check-in session yet (tracking can still ping pre-tier).
+ * Read tier + next_checkin_at for the ping response. Lazily creates a
+ * Tier-1 session on first call so the client gets a live countdown from
+ * the very first ping (instead of falling back to its hardcoded default).
  */
 export function getCheckinSnapshot(userId: string): {
   tier: Tier;
   tier_name: string;
   interval_minutes: number;
   next_checkin_at: string | null;
-} | null {
-  const s = checkinStore[userId];
-  if (!s || !s.active) return null;
+} {
+  const s = ensureCheckinSession(userId);
   return {
     tier: s.tier,
     tier_name: TIER_CONFIG[s.tier].name,
