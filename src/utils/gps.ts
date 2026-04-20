@@ -18,9 +18,14 @@ type RedisClient = ReturnType<typeof createClient>;
 
 const MAX_SPEED_MS = 80;          // ~290 km/h
 const STATIONARY_THRESHOLD = 4;   // meters
-const MAX_JUMP_DIST = 300;        // meters
+const MAX_JUMP_DIST = 300;        // meters — for high-accuracy fixes
 const MAX_DT = 60;                // seconds — covers Doze gaps
-const ACCURACY_THRESHOLD = 35;    // meters
+// Upper sanity bound for accuracy. Anything beyond this is genuinely garbage.
+// Bumped from 35 → 10_000 so cell-tower-only fixes (Tier 1 = Accuracy.Lowest
+// on the client) are accepted. Their accuracy is typically 500–3000 m, far
+// over the old 35 m gate. The Kalman filter's adaptiveR already reduces its
+// trust in low-accuracy fixes, so we don't need a hard reject here.
+const ACCURACY_THRESHOLD = 10_000;
 export const MAX_FILTER_STREAK = 3;      // reset after 3 consecutive filtered points
 export const GAP_RESET_SECONDS = 60;     // if gap > 60s, treat as fresh start
 
@@ -171,7 +176,13 @@ export function processLocation(
     newLat, newLng
   );
 
-  if (rawDist > MAX_JUMP_DIST) return null;
+  // Allow a jump up to MAX_JUMP_DIST OR ~2× the reported accuracy, whichever
+  // is larger. A cell-tower fix with accuracy=1500m can legitimately appear
+  // to "jump" by ~1500m between two consecutive stationary readings — that's
+  // not a spike, that's just the measurement uncertainty. The Kalman + later
+  // speed check still catches actual teleportation.
+  const jumpBudget = Math.max(MAX_JUMP_DIST, normalizedAccuracy * 2);
+  if (rawDist > jumpBudget) return null;
 
   const rawSpeed = rawDist / dt;
   if (rawSpeed > MAX_SPEED_MS) return null;
