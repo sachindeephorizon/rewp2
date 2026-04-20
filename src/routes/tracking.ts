@@ -198,6 +198,10 @@ async function checkDeviation(
 // Streak counts of consecutive pings outside the H3 corridor.
 //   3..7   → "short"  → bump check-in tier to T2
 //   ≥ 8    → "long"   → bump check-in tier to T3
+//
+// NOTE: client doesn't duplicate these — it reads `severity` off the ping
+// response. If you change them, the rewp2 → client contract still holds via
+// DeviationAlert.severity in src/api/monitoring.ts on the client.
 const SHORT_DEV_STREAK = 3;
 const LONG_DEV_STREAK = 8;
 
@@ -207,11 +211,13 @@ const ARRIVAL_RADIUS_M = 200;
 
 // ── Inactivity (distance-window) ─────────────────────────────────────────────
 // Per PRD: distance covered in the last 10 min < 30 m AND not near destination.
-// TESTING: window shortened to 60s so emulator demos don't take 10 minutes to fire.
-// Production value: 600 (10 min).
-const INACTIVITY_WINDOW_S = 60;
+//
+// MUST stay in sync with the client's TierSignalService:
+//   src/features/monitoring/tierSignal.ts → INACTIVITY_WINDOW_MS, INACTIVITY_DISTANCE_M
+//   src/features/monitoring/MonitoringSession.tsx → NEAR_DESTINATION_M
+const INACTIVITY_WINDOW_S = 600;          // 10 minutes
 const INACTIVITY_DISTANCE_M = 30;         // total displacement threshold
-const INACTIVITY_NEAR_DEST_M = ARRIVAL_RADIUS_M * 2; // suppress when ≈ at destination
+const INACTIVITY_NEAR_DEST_M = ARRIVAL_RADIUS_M * 2; // 400 m — suppress when ≈ at destination
 
 interface InactivitySample {
   t: number;   // epoch ms
