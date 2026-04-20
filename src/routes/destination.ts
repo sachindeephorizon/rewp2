@@ -23,10 +23,11 @@ const routeKey = (userId: string) => `nav:route:${userId}`;
 router.post("/:id/set", async (req: Request, res: Response) => {
   try {
     const userId = req.params.id as string;
-    const { origin, destination } = req.body as {
+    const { origin, destination, tripType } = req.body as {
       origin?: LatLng;
       destination?: LatLng;
       name?: string;
+      tripType?: 'cab' | 'walking' | 'meeting' | 'custom';
     };
 
     if (!userId || typeof userId !== "string") {
@@ -41,8 +42,15 @@ router.post("/:id/set", async (req: Request, res: Response) => {
       return;
     }
 
-    // 1. Fetch OSRM route
-    const { route, distance, duration } = await fetchOsrmRoute(origin, destination);
+    // Map app trip type → OSRM routing profile.
+    //   cab / meeting / custom → driving
+    //   walking                → walking (falls back to driving + rescaled
+    //                            duration if the OSRM server doesn't support it)
+    const osrmProfile = tripType === 'walking' ? 'walking' : 'driving';
+
+    // 1. Fetch OSRM route with the right profile
+    const { route, distance, duration, profileUsed } =
+      await fetchOsrmRoute(origin, destination, osrmProfile);
 
     // 2. Build dual H3 corridors at resolution 10
     const innerCells = buildH3Corridor(route, { resolution: 10, buffer: 0 });
@@ -107,6 +115,8 @@ router.post("/:id/set", async (req: Request, res: Response) => {
       distance,
       duration,
       routePoints: route.length,
+      tripType: tripType ?? null,
+      profileUsed,
     });
   } catch (err) {
     console.error("[POST /destination/:id/set] Error:", (err as Error).message);
