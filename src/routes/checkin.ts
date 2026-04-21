@@ -412,19 +412,50 @@ export async function escalateOnDeviation(
  * Read tier + next_checkin_at for the ping response. Lazily creates a
  * Tier-1 session on first call so the client gets a live countdown from
  * the very first ping (instead of falling back to its hardcoded default).
+ *
+ * SIDE EFFECT: also auto-detects an overdue check-in (now > deadline +
+ * countdown_seconds with no response). When the app is backgrounded the
+ * client's setInterval-based 30s countdown can't run, so the server is
+ * the source of truth for "missed". On detection we mark missed, jump
+ * tier to T3, trigger escalation, and return `missed: true` so the
+ * client can react on its next ping (BG or FG).
  */
 export function getCheckinSnapshot(userId: string): {
   tier: Tier;
   tier_name: string;
   interval_minutes: number;
   next_checkin_at: string | null;
+  missed: boolean;
 } {
   const s = ensureCheckinSession(userId);
+
+  // Server-side overdue detection — runs on every ping read.
+  let missedNow = false;
+  if (
+    s.next_checkin_at &&
+    s.last_response === 'pending' &&
+    s.tier < 3
+  ) {
+    const dueMs = new Date(s.next_checkin_at).getTime();
+    const overdueByMs = Date.now() - (dueMs + s.countdown_seconds * 1000);
+    if (overdueByMs > 0) {
+      // Mark missed, jump to T3, kick off escalation. Synchronous so the
+      // very response that detects this also surfaces the new tier.
+      s.last_response = 'missed';
+      s.missed_count += 1;
+      // Jump straight to T3 per spec — missed check-in is "the strongest
+      // possible signal that the user can't respond".
+      shiftTier(s, 3, 'missed_checkin_overdue').catch(() => {});
+      missedNow = true;
+    }
+  }
+
   return {
     tier: s.tier,
     tier_name: TIER_CONFIG[s.tier].name,
     interval_minutes: s.interval_minutes,
     next_checkin_at: s.next_checkin_at,
+    missed: missedNow,
   };
 }
 

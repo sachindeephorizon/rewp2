@@ -414,6 +414,7 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
         tierName: tierSnap?.tier_name ?? null,
         intervalMinutes: tierSnap?.interval_minutes ?? null,
         nextCheckinAt: tierSnap?.next_checkin_at ?? null,
+        missedCheckin: tierSnap?.missed ?? false,
       });
       return;
     }
@@ -701,6 +702,7 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
       tierName: tierSnap?.tier_name ?? null,
       intervalMinutes: tierSnap?.interval_minutes ?? null,
       nextCheckinAt: tierSnap?.next_checkin_at ?? null,
+      missedCheckin: tierSnap?.missed ?? false,
     });
   } catch (err) {
     console.error("[POST /:id/ping] Error:", (err as Error).message);
