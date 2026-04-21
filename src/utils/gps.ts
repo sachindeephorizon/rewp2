@@ -18,14 +18,17 @@ type RedisClient = ReturnType<typeof createClient>;
 
 const MAX_SPEED_MS = 80;          // ~290 km/h
 const STATIONARY_THRESHOLD = 4;   // meters
-const MAX_JUMP_DIST = 300;        // meters — for high-accuracy fixes
+const MAX_JUMP_DIST = 300;        // meters — fixed, no accuracy multiplier
 const MAX_DT = 60;                // seconds — covers Doze gaps
-// Upper sanity bound for accuracy. Anything beyond this is genuinely garbage.
-// Bumped from 35 → 10_000 so cell-tower-only fixes (Tier 1 = Accuracy.Lowest
-// on the client) are accepted. Their accuracy is typically 500–3000 m, far
-// over the old 35 m gate. The Kalman filter's adaptiveR already reduces its
-// trust in low-accuracy fixes, so we don't need a hard reject here.
-const ACCURACY_THRESHOLD = 10_000;
+// Strict accuracy gate. Cell-tower-only fixes (Accuracy.Lowest on the
+// client) report accuracy values of 500–3000 m and get rejected here —
+// that's intentional. The client takes ONE good Balanced-accuracy seed
+// fix at session start (~10 m), which passes this gate and populates
+// /users/active. After that, only legitimate fixes (T2/T3 GPS, or T1
+// fixes that happen to be WiFi-assisted under 35 m) update Redis. The
+// trail stays clean even when the user is stationary; cell-tower
+// jitter no longer pollutes /sessions/*/logs.
+const ACCURACY_THRESHOLD = 35;
 export const MAX_FILTER_STREAK = 3;      // reset after 3 consecutive filtered points
 export const GAP_RESET_SECONDS = 60;     // if gap > 60s, treat as fresh start
 
@@ -176,13 +179,12 @@ export function processLocation(
     newLat, newLng
   );
 
-  // Allow a jump up to MAX_JUMP_DIST OR ~2× the reported accuracy, whichever
-  // is larger. A cell-tower fix with accuracy=1500m can legitimately appear
-  // to "jump" by ~1500m between two consecutive stationary readings — that's
-  // not a spike, that's just the measurement uncertainty. The Kalman + later
-  // speed check still catches actual teleportation.
-  const jumpBudget = Math.max(MAX_JUMP_DIST, normalizedAccuracy * 2);
-  if (rawDist > jumpBudget) return null;
+  // Strict jump bound. A real, accurate GPS fix shouldn't move more than
+  // 300 m in a single ping (~70 m/s × the typical 4-s gap = 280 m). Larger
+  // is treated as a spike and rejected. This is what keeps the trail clean
+  // when the user is stationary — without it, cell-tower noise would draw
+  // a scattered cloud of dots over a single point.
+  if (rawDist > MAX_JUMP_DIST) return null;
 
   const rawSpeed = rawDist / dt;
   if (rawSpeed > MAX_SPEED_MS) return null;
