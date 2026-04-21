@@ -149,11 +149,18 @@ export function processLocation(
       ? accuracy
       : ACCURACY_THRESHOLD;
 
-  if (normalizedAccuracy <= 0 || normalizedAccuracy > ACCURACY_THRESHOLD) return null;
+  // Reject only genuinely bogus accuracy values (zero/negative).
+  // The accuracy gate proper is applied below, AFTER the bypass paths
+  // (first ping, post-gap reset) — so the seed always lands regardless
+  // of how noisy the device's first reading is.
+  if (normalizedAccuracy <= 0) return null;
 
   const now = timestamp || Date.now();
 
-  // No previous point — always accept as first reading
+  // ── BYPASS 1: No previous point — accept the very first ping
+  // unconditionally. This is what /users/active depends on populating
+  // the moment Start Monitoring is tapped, even if the device's first
+  // fix is cell-tower-only and 1500 m accurate.
   if (!prevEntry) {
     const filtered = kalman.update([newLat, newLng], 1, normalizedAccuracy);
     return { latitude: filtered[0], longitude: filtered[1], timestamp: now };
@@ -161,7 +168,8 @@ export function processLocation(
 
   const gapSeconds = (now - prevEntry.timestamp) / 1000;
 
-  // GAP DETECTION: if too much time has passed since last ping
+  // ── BYPASS 2: Long gap since last ping — also accept unconditionally.
+  // Treat as a fresh start (re-open after Doze, app relaunch, etc.).
   if (gapSeconds > GAP_RESET_SECONDS) {
     console.log(
       `[gps] Gap detected: ${gapSeconds.toFixed(0)}s — accepting as fresh start`
@@ -170,6 +178,11 @@ export function processLocation(
     const filtered = kalman.update([newLat, newLng], 1, normalizedAccuracy);
     return { latitude: filtered[0], longitude: filtered[1], timestamp: now };
   }
+
+  // ── Continuous-ping path: now apply the strict accuracy gate. Cell-
+  // tower fixes (~500–3000 m) get rejected here, keeping the trail
+  // clean when the user is stationary.
+  if (normalizedAccuracy > ACCURACY_THRESHOLD) return null;
 
   const dt = Math.min(gapSeconds, MAX_DT);
   if (dt <= 0) return null;
