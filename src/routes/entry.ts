@@ -1,4 +1,5 @@
 import express, { Router, Request, Response } from 'express';
+import { resetCheckinForUser } from './checkin';
 
 const router: Router = express.Router();
 
@@ -51,6 +52,12 @@ router.post('/entry', async (req: Request, res: Response) => {
   if (!user_id) {
     return res.status(400).json({ error: 'user_id is required' });
   }
+
+  // Wipe any leftover check-in state from a previous session. Without this,
+  // a stale `checkinStore[userId]` with overdue `next_checkin_at` triggers
+  // the overdue-detection in getCheckinSnapshot on the first ping of this
+  // new session — escalation fires instantly, which is obviously wrong.
+  resetCheckinForUser(user_id);
 
   const session_id = `session_${user_id}_${Date.now()}`;
 

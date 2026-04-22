@@ -346,7 +346,24 @@ router.put('/checkin/:user_id/stop', (req: Request<{ user_id: string }>, res: Re
   });
 });
 
-// ── Internal helpers used by tracking.ts (no HTTP round-trip) ──────────────
+// ── Internal helpers used by tracking.ts + entry.ts (no HTTP round-trip) ──
+
+/**
+ * Reset the in-memory check-in state for a user. Call this when a NEW
+ * monitoring session begins (POST /handling/entry) so the previous
+ * session's overdue `next_checkin_at` doesn't trigger an instant
+ * "missed" + escalation cascade on the first ping of the new session.
+ *
+ * Without this: stale `checkinStore[userId]` survives process restarts /
+ * old sessions, getCheckinSnapshot's overdue detection fires immediately,
+ * client engine flips to T3, and the user sees "ALERT — Check-in missed"
+ * within seconds of tapping Start Monitoring.
+ */
+export function resetCheckinForUser(userId: string): void {
+  delete checkinStore[userId];
+}
+
+
 
 /**
  * Lazily create a check-in session if one doesn't already exist for this user.
