@@ -5,14 +5,10 @@ const router: Router = express.Router();
 
 const LOCATION_SERVICE_URL = process.env.LOCATION_SERVICE_URL || 'http://localhost:3001';
 
-// ── Tier config ──
-// Tier 1 (Passive):   smooth trip, check every 30 min — cell-tower / low-power
-// Tier 2 (Active):    short deviation OR inactivity, check every 15 min — balanced GPS
-// Tier 3 (Emergency): long deviation OR missed check-in, every 5 min — full GPS
 export const TIER_CONFIG = {
-  1: { name: 'passive',   interval_minutes: 3, countdown_seconds: 10 },
-  2: { name: 'active',    interval_minutes: 2, countdown_seconds: 10 },
-  3: { name: 'emergency', interval_minutes: 1,  countdown_seconds: 10 },
+  1: { name: 'passive',   interval_minutes: 15, countdown_seconds: 30 },
+  2: { name: 'active',    interval_minutes: 10, countdown_seconds: 30 },
+  3: { name: 'emergency', interval_minutes: 5,  countdown_seconds: 30 },
 } as const;
 
 export type Tier = 1 | 2 | 3;
