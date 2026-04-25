@@ -98,6 +98,7 @@ const buildLocationPayload = ({
   sequence: Number.isInteger(body.sequence) ? body.sequence! : null,
   gpsIntervalMs: toNullableNumber(body.gpsIntervalMs),
   timestamp: now,
+  gpsTimestamp: toNullableNumber(body.timestamp),
   startedAt: sessionStartedAt,
   roomNames: streamMeta.roomNames,
 });
@@ -766,73 +767,16 @@ router.post("/:id/stop", async (req: Request, res: Response) => {
       [userId]
     ).catch(() => ({ rows: [{ cnt: 0 }] }));
 
-    const sessionResult = await pool.query(
-      `INSERT INTO sessions (
-        user_id, session_name, status, started_at, ended_at, duration_secs, total_pings,
-        start_location, end_location,
-        origin_lat, origin_lng, dest_lat, dest_lng, dest_label,
-        route_polyline, route_h3_corridor, deviation_count
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id`,
-      [
-        userId, sessionName, 'completed', sessionStart, now, durationSecs, parsedLogs.length,
-        startLocation, endLocation,
-        destInfo?.origin?.lat || firstLog?.lat || null,
-        destInfo?.origin?.lng || firstLog?.lng || null,
-        destInfo?.destination?.lat || null,
-        destInfo?.destination?.lng || null,
-        destInfo?.name || null,
-        routeRaw || null,
-        corridorRaw || null,
-        parseInt(devCountRes.rows[0].cnt as string, 10) || 0,
-      ]
-    );
-    const dbSessionId = sessionResult.rows[0].id as number;
-
-    if (parsedLogs.length > 0) {
-      const sample = parsedLogs[0];
-      console.log(`[stop] Sample log shape:`, JSON.stringify({
-        keys: Object.keys(sample),
-        speed: sample.speed,
-        speedType: typeof sample.speed,
-        accuracy: sample.accuracy,
-        accuracyType: typeof sample.accuracy,
-      }));
-    }
-
-    const batchSize = 500;
-    for (let b = 0; b < parsedLogs.length; b += batchSize) {
-      const batch = parsedLogs.slice(b, b + batchSize);
-      const values: string[] = [];
-      const params: (number | string | null)[] = [];
-      batch.forEach((point, index) => {
-        const offset = index * 7;
-        values.push(`($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5},$${offset + 6},$${offset + 7})`);
-        const speedKmh = typeof point.speed === 'number' ? point.speed * 3.6 : null;
-        const accuracyVal = typeof point.accuracy === 'number' ? point.accuracy : null;
-        params.push(dbSessionId, point.lat, point.lng, point.h3Cell || null, speedKmh, accuracyVal, point.timestamp);
-      });
-      await pool.query(
-        `INSERT INTO location_logs (session_id, lat, lng, h3_cell, speed_kmh, accuracy_m, recorded_at) VALUES ${values.join(",")}`,
-        params
-      );
-    }
-
-    console.log(`[stop] ${sessionName} | ${parsedLogs.length} pts | ${durationSecs}s`);
-
-    const lastPt = parsedLogs[parsedLogs.length - 1];
-    pool.query(
-      `INSERT INTO session_events (session_id, user_id, event_type, lat, lng, metadata)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [dbSessionId, userId, 'session_ended', lastPt?.lat, lastPt?.lng, JSON.stringify({ durationSecs, totalPings: parsedLogs.length, sessionName })]
-    ).catch(() => {});
-
-    clearUserState(userId);
-
+    // ── 1. STOP THE LIVE STREAM IMMEDIATELY ──────────────────────────────
+    // Tear down the live signal BEFORE the slow DB writes so the dashboard
+    // sees "user stopped" instantly and any in-flight pings get rejected
+    // (their session no longer in ACTIVE_SET / has no user:* key).
+    // Redis keys that hold the source data for the DB save (sessionLogsKey,
+    // trailKey, sessionStartKey, sessionMetaKey, startMarkerKey) are
+    // intentionally NOT deleted here — they're needed below.
     const finalLog = parsedLogs[parsedLogs.length - 1];
-    const stopMarker = finalLog ? { lat: finalLog.lat, lng: finalLog.lng } : null;
     const startMarker = startMarkerRaw ? JSON.parse(startMarkerRaw) as { lat: number; lng: number } : null;
-    const rawTrail = trailDots.map((d) => JSON.parse(d) as { lat: number; lng: number; timestamp?: string });
-    const parsedTrail = rawTrail.length >= 2 ? await snapTrajectory(rawTrail) : rawTrail;
+    const stopMarker = finalLog ? { lat: finalLog.lat, lng: finalLog.lng } : null;
 
     const stopPayload = {
       event: "tracking_stopped",
@@ -851,11 +795,6 @@ router.post("/:id/stop", async (req: Request, res: Response) => {
 
     await Promise.all([
       redis.del(`user:${userId}`),
-      redis.del(sessionStartKey),
-      redis.del(sessionMetaKey),
-      redis.del(sessionLogsKey),
-      redis.del(trailKey),
-      redis.del(startMarkerKey),
       redis.del(`nav:dest:${userId}`),
       redis.del(`nav:corridor:${userId}`),
       redis.del(`nav:inner:${userId}`),
@@ -866,25 +805,106 @@ router.post("/:id/stop", async (req: Request, res: Response) => {
       redis.sRem(ACTIVE_SET, userId),
       redis.publish(CHANNEL, JSON.stringify(stopPayload)),
     ]);
+    clearUserState(userId);
 
+    // ── 2. RESPOND TO THE CLIENT IMMEDIATELY ─────────────────────────────
+    // The mobile UI no longer has to wait for the 9k-row INSERT loop. The
+    // session id is unknown until the DB INSERT runs below; we send a
+    // pending marker so the client can navigate to the summary screen,
+    // which fetches the persisted session by user_id once it lands.
     res.status(200).json({
       ok: true,
-      session: {
-        id: dbSessionId,
-        name: sessionName,
-        userId,
-        startedAt: sessionStart,
-        endedAt: now,
-        durationSecs,
-        totalPings: parsedLogs.length,
-        startLocation,
-        endLocation,
-        startMarker,
-        stopMarker,
-        trail: parsedTrail,
-        stream: storedSessionMeta,
-      },
+      pending: true,                // session row + logs save in background
+      userId,
+      startedAt: sessionStart,
+      endedAt: now,
+      durationSecs,
+      totalPings: parsedLogs.length,
+      startLocation,
+      endLocation,
+      startMarker,
+      stopMarker,
+      stream: storedSessionMeta,
     });
+
+    // ── 3. PERSIST TO POSTGRES IN BACKGROUND ─────────────────────────────
+    // The live signal is already gone. The only thing left is durable
+    // archival. We do it after the response so the user isn't blocked on
+    // 9000-row inserts. Failure here does NOT roll back the stop — the
+    // session is functionally over from the user's perspective.
+    void (async () => {
+      let dbSessionId: number | null = null;
+      try {
+        const sessionResult = await pool.query(
+          `INSERT INTO sessions (
+            user_id, session_name, status, started_at, ended_at, duration_secs, total_pings,
+            start_location, end_location,
+            origin_lat, origin_lng, dest_lat, dest_lng, dest_label,
+            route_polyline, route_h3_corridor, deviation_count
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id`,
+          [
+            userId, sessionName, 'completed', sessionStart, now, durationSecs, parsedLogs.length,
+            startLocation, endLocation,
+            destInfo?.origin?.lat || firstLog?.lat || null,
+            destInfo?.origin?.lng || firstLog?.lng || null,
+            destInfo?.destination?.lat || null,
+            destInfo?.destination?.lng || null,
+            destInfo?.name || null,
+            routeRaw || null,
+            corridorRaw || null,
+            parseInt(devCountRes.rows[0].cnt as string, 10) || 0,
+          ]
+        );
+        dbSessionId = sessionResult.rows[0].id as number;
+
+        const batchSize = 500;
+        for (let b = 0; b < parsedLogs.length; b += batchSize) {
+          const batch = parsedLogs.slice(b, b + batchSize);
+          const values: string[] = [];
+          const params: (number | string | null)[] = [];
+          batch.forEach((point, index) => {
+            const offset = index * 7;
+            values.push(`($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5},$${offset + 6},$${offset + 7})`);
+            const speedKmh = typeof point.speed === 'number' ? point.speed * 3.6 : null;
+            const accuracyVal = typeof point.accuracy === 'number' ? point.accuracy : null;
+            params.push(dbSessionId, point.lat, point.lng, point.h3Cell || null, speedKmh, accuracyVal, point.timestamp);
+          });
+          await pool.query(
+            `INSERT INTO location_logs (session_id, lat, lng, h3_cell, speed_kmh, accuracy_m, recorded_at) VALUES ${values.join(",")}`,
+            params
+          );
+        }
+
+        const lastPt = parsedLogs[parsedLogs.length - 1];
+        await pool.query(
+          `INSERT INTO session_events (session_id, user_id, event_type, lat, lng, metadata)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [dbSessionId, userId, 'session_ended', lastPt?.lat, lastPt?.lng, JSON.stringify({ durationSecs, totalPings: parsedLogs.length, sessionName })]
+        ).catch(() => {});
+
+        console.log(`[stop] persisted ${sessionName} | ${parsedLogs.length} pts | ${durationSecs}s`);
+
+        // Now safe to delete source-of-truth Redis keys — DB has the data.
+        await Promise.all([
+          redis.del(sessionStartKey),
+          redis.del(sessionMetaKey),
+          redis.del(sessionLogsKey),
+          redis.del(trailKey),
+          redis.del(startMarkerKey),
+        ]);
+      } catch (persistErr) {
+        // Leave the redis source keys intact so a future retry / restart
+        // routine can drain them. The stop signal already went out, so the
+        // user-visible state is consistent — only the durable archive is
+        // delayed.
+        console.error(
+          `[stop] background persist failed for ${userId} (sessionId=${dbSessionId ?? 'unassigned'}):`,
+          (persistErr as Error).message,
+        );
+      }
+    })();
+
+    return;
   } catch (err) {
     console.error("[POST /:id/stop] Error:", (err as Error).message);
     res.status(500).json({ error: "Internal server error" });

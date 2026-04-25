@@ -122,11 +122,42 @@ export function initSocket(httpServer: HttpServer): Server {
 
   const lastGlobalEmitTime = new Map<string, number>();
   const pendingGlobalEmit = new Map<string, ReturnType<typeof setTimeout>>();
+  // Last GPS-fix timestamp we emitted for each user. Anything older arriving
+  // afterward (e.g. background-batch ping carrying stale fixes) is dropped.
+  // Without this guard the live dashboard dot bounces between old and new
+  // positions when foreground + background pings race.
+  const lastEmittedGpsTs = new Map<string, number>();
+
+  function readGpsTs(data: LocationData): number {
+    const v = (data as unknown as { gpsTimestamp?: number }).gpsTimestamp;
+    return typeof v === "number" && Number.isFinite(v) ? v : 0;
+  }
 
   const emitGlobalThrottled = (data: LocationData): void => {
     const userId = data.userId;
     if (!userId) {
       io.emit(SOCKET_GLOBAL_EVENT, data);
+      return;
+    }
+
+    // Stop events bypass the throttle — the dashboard needs to see "user
+    // stopped" instantly, not 2 s late behind a queued location update.
+    if (data.stopped || data.event === "tracking_stopped") {
+      lastEmittedGpsTs.delete(userId);
+      lastGlobalEmitTime.delete(userId);
+      const t = pendingGlobalEmit.get(userId);
+      if (t) clearTimeout(t);
+      pendingGlobalEmit.delete(userId);
+      io.emit(SOCKET_GLOBAL_EVENT, data);
+      return;
+    }
+
+    // Drop out-of-order GPS fixes (background batch carrying older fixes
+    // racing foreground "now" pings). Use the client's GPS timestamp, not
+    // the server-receipt timestamp — receipt order doesn't reflect fix age.
+    const incomingTs = readGpsTs(data);
+    const lastTs = lastEmittedGpsTs.get(userId) ?? 0;
+    if (incomingTs && lastTs && incomingTs <= lastTs) {
       return;
     }
 
@@ -136,14 +167,22 @@ export function initSocket(httpServer: HttpServer): Server {
 
     if (elapsed >= GLOBAL_EMIT_INTERVAL_MS) {
       lastGlobalEmitTime.set(userId, now);
+      if (incomingTs) lastEmittedGpsTs.set(userId, incomingTs);
       io.emit(SOCKET_GLOBAL_EVENT, data);
       return;
     }
 
     if (pendingGlobalEmit.has(userId)) clearTimeout(pendingGlobalEmit.get(userId));
     pendingGlobalEmit.set(userId, setTimeout(() => {
+      // Re-check at fire time — a newer ping during the wait may have
+      // already been emitted via the immediate path; don't overwrite it
+      // with stale buffered data.
+      const currentTs = readGpsTs(data);
+      const guardTs = lastEmittedGpsTs.get(userId) ?? 0;
       lastGlobalEmitTime.set(userId, Date.now());
       pendingGlobalEmit.delete(userId);
+      if (currentTs && guardTs && currentTs <= guardTs) return;
+      if (currentTs) lastEmittedGpsTs.set(userId, currentTs);
       io.emit(SOCKET_GLOBAL_EVENT, data);
     }, GLOBAL_EMIT_INTERVAL_MS - elapsed));
   };

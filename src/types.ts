@@ -81,6 +81,13 @@ export interface LocationPayload {
   sequence: number | null;
   gpsIntervalMs: number | null;
   timestamp: string;
+  // Client's GPS-fix epoch ms (forwarded from body.timestamp). Used by the
+  // socket layer to drop out-of-order publishes — Android batches BG
+  // location updates, so a foreground ping with the latest fix can race a
+  // background ping carrying older fixes from the same batch. Without an
+  // independent client timestamp, server receipt order misorders them and
+  // the dashboard dot bounces between old and new positions.
+  gpsTimestamp: number | null;
   startedAt: string;
   roomNames: string[];
   h3Cell?: string;
