@@ -3,7 +3,7 @@ import { redis } from "../redis";
 import { pool } from "../db";
 import { getIo } from "../socket";
 import {
-  processLocation,
+  processLocationDetailed,
   getUserState,
   saveUserState,
   clearUserState,
@@ -375,13 +375,14 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
       }
     }
 
-    const processed = processLocation(
+    const processedResult = processLocationDetailed(
       lat, lng,
       state.prev,
       state.kalman,
       userAccuracy,
       userTimestamp
     );
+    const processed = processedResult.location;
 
     // ── FILTERED PING ─────────────────────────────────────────────────────────
     if (!processed) {
@@ -418,7 +419,7 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
             res.status(200).json({
         ok: true,
         filtered: true,
-        reason: "GPS spike rejected",
+        reason: processedResult.reason ?? "gps_filtered",
         streak: state.filterStreak,
         streamKey: streamMeta.streamKey,
         rideChannel: streamMeta.rideChannel,
@@ -493,7 +494,7 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
     });
     payload.h3Cell = latLngToH3Cell(lat, lng, 10);
 
-    const locationPoint = JSON.stringify({
+    let locationPoint = JSON.stringify({
       lat: finalLat,
       lng: finalLng,
       h3Cell,
@@ -505,6 +506,8 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
       activity: payload.activity,
       source: payload.source,
       sequence: payload.sequence,
+      deviationFlag: false,
+      inactivityFlag: false,
     });
 
     const sessionMeta: SessionMeta = {
@@ -538,7 +541,16 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
           redis.lRange(sessionLogsKey, 0, -1),
         ]);
         if (oldStart && oldLogs && oldLogs.length > 0) {
-          const parsedOldLogs = oldLogs.map((l) => JSON.parse(l) as { lat: number; lng: number; h3Cell?: string; speed?: number; accuracy?: number; timestamp: string });
+          const parsedOldLogs = oldLogs.map((l) => JSON.parse(l) as {
+            lat: number;
+            lng: number;
+            h3Cell?: string;
+            speed?: number;
+            accuracy?: number;
+            deviationFlag?: boolean;
+            inactivityFlag?: boolean;
+            timestamp: string;
+          });
           const oldSessionStart = new Date(oldStart);
           const oldNow = new Date();
           const oldDuration = Math.floor((oldNow.getTime() - oldSessionStart.getTime()) / 1000);
@@ -567,15 +579,25 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
           for (let b = 0; b < parsedOldLogs.length; b += batchSize) {
             const batch = parsedOldLogs.slice(b, b + batchSize);
             const vals: string[] = [];
-            const params: (number | string | null)[] = [];
+            const params: (number | string | boolean | null)[] = [];
             batch.forEach((point, index) => {
-              const offset = index * 7;
-              vals.push(`($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5},$${offset + 6},$${offset + 7})`);
+              const offset = index * 9;
+              vals.push(`($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5},$${offset + 6},$${offset + 7},$${offset + 8},$${offset + 9})`);
               const speedKmh = typeof point.speed === 'number' ? point.speed * 3.6 : null;
-              params.push(oldSid, point.lat, point.lng, point.h3Cell || null, speedKmh, point.accuracy || null, point.timestamp);
+              params.push(
+                oldSid,
+                point.lat,
+                point.lng,
+                point.h3Cell || null,
+                speedKmh,
+                point.accuracy || null,
+                !!point.deviationFlag,
+                !!point.inactivityFlag,
+                point.timestamp,
+              );
             });
             await pool.query(
-              `INSERT INTO location_logs (session_id, lat, lng, h3_cell, speed_kmh, accuracy_m, recorded_at) VALUES ${vals.join(",")}`,
+              `INSERT INTO location_logs (session_id, lat, lng, h3_cell, speed_kmh, accuracy_m, deviation_flag, inactivity_flag, recorded_at) VALUES ${vals.join(",")}`,
               params
             );
           }
@@ -718,6 +740,15 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
 
     const tierSnap = getCheckinSnapshot(userId);
 
+    try {
+      const parsedPoint = JSON.parse(locationPoint) as Record<string, unknown>;
+      parsedPoint.deviationFlag = devStreak > 0;
+      parsedPoint.inactivityFlag = inactivityFlag;
+      locationPoint = JSON.stringify(parsedPoint);
+    } catch {
+      // best-effort only
+    }
+
     res.status(200).json({
       ok: true,
       data: payload,
@@ -779,7 +810,7 @@ router.post("/:id/stop", async (req: Request, res: Response) => {
     const durationSecs = Math.floor((now.getTime() - sessionStart.getTime()) / 1000);
     const parsedLogs = logs.map((l) => JSON.parse(l) as {
       lat: number; lng: number; h3Cell?: string; speed?: number;
-      accuracy?: number; timestamp: string;
+      accuracy?: number; deviationFlag?: boolean; inactivityFlag?: boolean; timestamp: string;
     });
 
     const firstLog = parsedLogs[0];
@@ -913,16 +944,26 @@ router.post("/:id/stop", async (req: Request, res: Response) => {
         for (let b = 0; b < parsedLogs.length; b += batchSize) {
           const batch = parsedLogs.slice(b, b + batchSize);
           const values: string[] = [];
-          const params: (number | string | null)[] = [];
+          const params: (number | string | boolean | null)[] = [];
           batch.forEach((point, index) => {
-            const offset = index * 7;
-            values.push(`($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5},$${offset + 6},$${offset + 7})`);
+            const offset = index * 9;
+            values.push(`($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5},$${offset + 6},$${offset + 7},$${offset + 8},$${offset + 9})`);
             const speedKmh = typeof point.speed === 'number' ? point.speed * 3.6 : null;
             const accuracyVal = typeof point.accuracy === 'number' ? point.accuracy : null;
-            params.push(dbSessionId, point.lat, point.lng, point.h3Cell || null, speedKmh, accuracyVal, point.timestamp);
+            params.push(
+              dbSessionId,
+              point.lat,
+              point.lng,
+              point.h3Cell || null,
+              speedKmh,
+              accuracyVal,
+              !!point.deviationFlag,
+              !!point.inactivityFlag,
+              point.timestamp,
+            );
           });
           await pool.query(
-            `INSERT INTO location_logs (session_id, lat, lng, h3_cell, speed_kmh, accuracy_m, recorded_at) VALUES ${values.join(",")}`,
+            `INSERT INTO location_logs (session_id, lat, lng, h3_cell, speed_kmh, accuracy_m, deviation_flag, inactivity_flag, recorded_at) VALUES ${values.join(",")}`,
             params
           );
         }

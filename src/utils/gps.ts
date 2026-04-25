@@ -32,6 +32,20 @@ const ACCURACY_THRESHOLD = 35;
 export const MAX_FILTER_STREAK = 3;      // reset after 3 consecutive filtered points
 export const GAP_RESET_SECONDS = 60;     // if gap > 60s, treat as fresh start
 
+export type GpsFilterReason =
+  | 'invalid_coordinates'
+  | 'invalid_accuracy'
+  | 'accuracy_too_low_precision'
+  | 'non_positive_dt'
+  | 'jump_too_large'
+  | 'raw_speed_too_high'
+  | 'filtered_speed_too_high';
+
+export interface ProcessLocationResult {
+  location: ProcessedLocation | null;
+  reason: GpsFilterReason | null;
+}
+
 // ── 2D Kalman Filter ────────────────────────────────────────────────
 export class KalmanFilter2D {
   x: number[] | null;
@@ -139,10 +153,28 @@ export function processLocation(
   accuracy: number | null = null,
   timestamp: number | null = null
 ): ProcessedLocation | null {
+  return processLocationDetailed(
+    newLat,
+    newLng,
+    prevEntry,
+    kalman,
+    accuracy,
+    timestamp,
+  ).location;
+}
+
+export function processLocationDetailed(
+  newLat: number,
+  newLng: number,
+  prevEntry: ProcessedLocation | null,
+  kalman: KalmanFilter2D,
+  accuracy: number | null = null,
+  timestamp: number | null = null
+): ProcessLocationResult {
   if (
     typeof newLat !== 'number' || typeof newLng !== 'number' ||
     newLat < -90 || newLat > 90 || newLng < -180 || newLng > 180
-  ) return null;
+  ) return { location: null, reason: 'invalid_coordinates' };
 
   const normalizedAccuracy =
     typeof accuracy === 'number' && isFinite(accuracy)
@@ -153,7 +185,7 @@ export function processLocation(
   // The accuracy gate proper is applied below, AFTER the bypass paths
   // (first ping, post-gap reset) — so the seed always lands regardless
   // of how noisy the device's first reading is.
-  if (normalizedAccuracy <= 0) return null;
+  if (normalizedAccuracy <= 0) return { location: null, reason: 'invalid_accuracy' };
 
   const now = timestamp || Date.now();
 
@@ -163,7 +195,10 @@ export function processLocation(
   // fix is cell-tower-only and 1500 m accurate.
   if (!prevEntry) {
     const filtered = kalman.update([newLat, newLng], 1, normalizedAccuracy);
-    return { latitude: filtered[0], longitude: filtered[1], timestamp: now };
+    return {
+      location: { latitude: filtered[0], longitude: filtered[1], timestamp: now },
+      reason: null,
+    };
   }
 
   const gapSeconds = (now - prevEntry.timestamp) / 1000;
@@ -176,16 +211,21 @@ export function processLocation(
     );
     kalman.reset();
     const filtered = kalman.update([newLat, newLng], 1, normalizedAccuracy);
-    return { latitude: filtered[0], longitude: filtered[1], timestamp: now };
+    return {
+      location: { latitude: filtered[0], longitude: filtered[1], timestamp: now },
+      reason: null,
+    };
   }
 
   // ── Continuous-ping path: now apply the strict accuracy gate. Cell-
   // tower fixes (~500–3000 m) get rejected here, keeping the trail
   // clean when the user is stationary.
-  if (normalizedAccuracy > ACCURACY_THRESHOLD) return null;
+  if (normalizedAccuracy > ACCURACY_THRESHOLD) {
+    return { location: null, reason: 'accuracy_too_low_precision' };
+  }
 
   const dt = Math.min(gapSeconds, MAX_DT);
-  if (dt <= 0) return null;
+  if (dt <= 0) return { location: null, reason: 'non_positive_dt' };
 
   const rawDist = haversineDistance(
     prevEntry.latitude, prevEntry.longitude,
@@ -197,19 +237,22 @@ export function processLocation(
   // is treated as a spike and rejected. This is what keeps the trail clean
   // when the user is stationary — without it, cell-tower noise would draw
   // a scattered cloud of dots over a single point.
-  if (rawDist > MAX_JUMP_DIST) return null;
+  if (rawDist > MAX_JUMP_DIST) return { location: null, reason: 'jump_too_large' };
 
   const rawSpeed = rawDist / dt;
-  if (rawSpeed > MAX_SPEED_MS) return null;
+  if (rawSpeed > MAX_SPEED_MS) return { location: null, reason: 'raw_speed_too_high' };
 
   const isStationary = rawDist < STATIONARY_THRESHOLD;
 
   if (isStationary) {
     kalman.update([prevEntry.latitude, prevEntry.longitude], dt, normalizedAccuracy, true);
     return {
-      latitude: prevEntry.latitude,
-      longitude: prevEntry.longitude,
-      timestamp: now,
+      location: {
+        latitude: prevEntry.latitude,
+        longitude: prevEntry.longitude,
+        timestamp: now,
+      },
+      reason: null,
     };
   }
 
@@ -219,9 +262,14 @@ export function processLocation(
     filtered[0], filtered[1]
   );
 
-  if (filteredDist / dt > MAX_SPEED_MS) return null;
+  if (filteredDist / dt > MAX_SPEED_MS) {
+    return { location: null, reason: 'filtered_speed_too_high' };
+  }
 
-  return { latitude: filtered[0], longitude: filtered[1], timestamp: now };
+  return {
+    location: { latitude: filtered[0], longitude: filtered[1], timestamp: now },
+    reason: null,
+  };
 }
 
 // ── Per-user state — Redis-backed ───────────────────────────────────
