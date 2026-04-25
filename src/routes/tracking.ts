@@ -112,11 +112,12 @@ async function checkDeviation(
   lng: number,
   streamMeta: StreamMetadata,
   destData: DestinationData
-): Promise<DeviationAlert | null> {
+): Promise<{ alert: DeviationAlert | null; streak: number }> {
   const devCell = latLngToH3Cell(lat, lng, 10);
-  const [inInner, inOuter] = await Promise.all([
+  const [inInner, inOuter, prevCount] = await Promise.all([
     redis.sIsMember(`nav:inner:${userId}`, devCell),
     redis.sIsMember(`nav:outer:${userId}`, devCell),
+    getDeviationStreak(userId),
   ]);
 
   if (inInner) {
@@ -133,14 +134,13 @@ async function checkDeviation(
         [userId, 'deviation_cleared', lat, lng]
       ).catch(() => {});
     }
-    return null;
+    return { alert: null, streak: 0 };
   }
 
   if (inOuter) {
-    return null;
+    return { alert: null, streak: prevCount };
   }
 
-  const prevCount = await getDeviationStreak(userId);
   const newCount = prevCount + 1;
   await setDeviationStreak(userId, newCount);
 
@@ -151,7 +151,7 @@ async function checkDeviation(
   let severity: 'short' | 'long' | null = null;
   if (newCount === SHORT_DEV_STREAK) severity = 'short';
   else if (newCount === LONG_DEV_STREAK) severity = 'long';
-  if (!severity) return null;
+  if (!severity) return { alert: null, streak: newCount };
 
   const alert: DeviationAlert = {
     userId,
@@ -192,8 +192,8 @@ async function checkDeviation(
     console.error('[deviation] escalateOnDeviation failed:', e.message)
   );
 
-  console.log(`[deviation] 🚨 ${userId} ${severity.toUpperCase()} alert | streak=${newCount}`);
-  return alert;
+    console.log(`[deviation] 🚨 ${userId} ${severity.toUpperCase()} alert | streak=${newCount}`);
+    return { alert, streak: newCount };
 }
 
 // ── Deviation classification thresholds ──────────────────────────────────────
@@ -342,6 +342,17 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
     if (lat < -90 || lat > 90) { res.status(400).json({ error: "lat must be between -90 and 90" }); return; }
     if (lng < -180 || lng > 180) { res.status(400).json({ error: "lng must be between -180 and 180" }); return; }
 
+    // ── ISSUE 7 FIX: Reject any ping that arrives after /stop. The mobile
+    // background task may keep firing for a few seconds while the OS tears
+    // it down — without this guard, those zombie pings re-create the
+    // session in Redis and the dashboard "user is still active". The flag
+    // is set in /stop with a 5-minute TTL.
+    const stoppedFlag = await redis.get(`stopped:${userId}`);
+    if (stoppedFlag) {
+      res.status(200).json({ ok: true, stopped: true, reason: "session_stopped" });
+      return;
+    }
+
     const userAccuracy = typeof accuracy === "number" ? accuracy : null;
     const userTimestamp = typeof timestamp === "number" ? timestamp : null;
 
@@ -384,8 +395,9 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
         await saveUserState(userId);
       }
 
-      let filteredDevAlert: DeviationAlert | null = null;
+          let filteredDevAlert: DeviationAlert | null = null;
       let filteredArrival = false;
+      let filteredDevStreak = 0;
 
       const filteredDestRaw = await redis.get(`nav:dest:${userId}`);
       if (filteredDestRaw) {
@@ -394,14 +406,16 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
         filteredArrival = await checkArrival(userId, lat, lng, fd, streamMeta, null);
 
         if (!filteredArrival) {
-          filteredDevAlert = await checkDeviation(userId, lat, lng, streamMeta, fd);
+          const r = await checkDeviation(userId, lat, lng, streamMeta, fd);
+          filteredDevAlert = r.alert;
+          filteredDevStreak = r.streak;
         }
       }
 
       const pendingReq = await redis.get(`locreq:${userId}`);
       const tierSnap = getCheckinSnapshot(userId);
 
-      res.status(200).json({
+            res.status(200).json({
         ok: true,
         filtered: true,
         reason: "GPS spike rejected",
@@ -411,6 +425,8 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
         sessionId: streamMeta.sessionId,
         forceRefresh: !!pendingReq,
         deviationAlert: filteredDevAlert,
+        deviationFlag: filteredDevStreak > 0,
+        speedKmh: typeof body.speed === 'number' && Number.isFinite(body.speed) ? Math.round(body.speed * 3.6 * 10) / 10 : null,
         arrivalDetected: filteredArrival,
         tier: tierSnap?.tier ?? null,
         tierName: tierSnap?.tier_name ?? null,
@@ -466,10 +482,16 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
     }
 
     const sessionStartedAt = existingSession || now;
+    // ── ISSUE 3 FIX: Broadcast RAW GPS coords to the dashboard, not the
+    // Kalman-filtered + snap-to-road coords. Snap-to-road causes the live
+    // dot to jitter when consecutive pings project to slightly different
+    // road-network points. Filtered coords (finalLat/finalLng) are still
+    // used below for trail/session-logs/DB so the persisted track stays
+    // clean — only the live dot uses raw.
     const payload = buildLocationPayload({
-      userId, streamMeta, sessionStartedAt, now, finalLat, finalLng, body,
+      userId, streamMeta, sessionStartedAt, now, finalLat: lat, finalLng: lng, body,
     });
-    payload.h3Cell = h3Cell;
+    payload.h3Cell = latLngToH3Cell(lat, lng, 10);
 
     const locationPoint = JSON.stringify({
       lat: finalLat,
@@ -602,9 +624,10 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
 
     // ── Navigation intelligence ───────────────────────────────────────────────
 
-    let deviationAlert: DeviationAlert | null = null;
+        let deviationAlert: DeviationAlert | null = null;
     let arrivalDetected = false;
     let inactivityFlag = false;
+    let devStreak = 0;
 
     const destRaw = await redis.get(`nav:dest:${userId}`);
     if (destRaw) {
@@ -616,7 +639,9 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
       arrivalDetected = await checkArrival(userId, rawLat, rawLng, destData, streamMeta, now);
 
       if (!arrivalDetected) {
-        deviationAlert = await checkDeviation(userId, rawLat, rawLng, streamMeta, destData);
+        const devResult = await checkDeviation(userId, rawLat, rawLng, streamMeta, destData);
+        deviationAlert = devResult.alert;
+        devStreak = devResult.streak;
 
         // Distance-window inactivity:
         //   distance covered in last 10 min < 30 m AND not near destination.
@@ -698,6 +723,15 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
       data: payload,
       forceRefresh,
       deviationAlert,
+      // ── ISSUE 1 FIX: deviationAlert is null between threshold crossings
+      // (streak ∈ {3,8} only). deviationFlag tells the client whether the
+      // user is CURRENTLY off-corridor regardless of threshold events, so
+      // the UI can keep showing "deviated" until they're back on track.
+      deviationFlag: devStreak > 0,
+      // ── ISSUE 2 FIX: body.speed is m/s (from expo-location); the
+      // dashboard wants km/h. Add a converted field so neither side has
+      // to remember to multiply by 3.6.
+      speedKmh: typeof body.speed === 'number' && Number.isFinite(body.speed) ? Math.round(body.speed * 3.6 * 10) / 10 : null,
       arrivalDetected,
       inactivityFlag,
       tier: tierSnap?.tier ?? null,
@@ -803,7 +837,14 @@ router.post("/:id/stop", async (req: Request, res: Response) => {
       redis.del(`nav:route:${userId}`),
       redis.del(`deviation:${userId}`),
       redis.del(`devstreak:${userId}`),
+      redis.del(`inactwin:${userId}`),
+      redis.del(`gpsstate:${userId}`),
       redis.sRem(ACTIVE_SET, userId),
+      // ── ISSUE 7 FIX: Stamp a "stopped" gate so any ping that arrives
+      // in the next 5 min (background task still draining, batched fixes
+      // racing the stop call) gets rejected at /ping entry instead of
+      // re-creating the session.
+      redis.set(`stopped:${userId}`, '1', { EX: 300 }),
       redis.publish(CHANNEL, JSON.stringify(stopPayload)),
     ]);
     clearUserState(userId);

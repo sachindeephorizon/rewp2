@@ -244,7 +244,13 @@ router.get("/:id/remaining", async (req: Request, res: Response) => {
       if (d < minDist) { minDist = d; minIdx = i; }
     }
 
-    let remaining = 0;
+    // ── ISSUE 4 FIX: When the user is OFF-route, the leg from their
+    // current position to the closest route point is real distance they
+    // still have to cover. The old code ignored it, so a deviated user
+    // saw `remaining` *decrease* even though they had to travel more.
+    // Threshold of 75 m suppresses normal GPS jitter for on-route cases.
+    const OFF_ROUTE_THRESHOLD_M = 75;
+    let remaining = minDist > OFF_ROUTE_THRESHOLD_M ? minDist : 0;
     for (let i = minIdx; i < route.length - 1; i++) {
       remaining += haversineDistance(
         route[i].lat, route[i].lng,
