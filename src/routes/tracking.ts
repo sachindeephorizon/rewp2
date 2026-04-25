@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { redis } from "../redis";
 import { pool } from "../db";
+import { getIo } from "../socket";
 import {
   processLocation,
   getUserState,
@@ -806,6 +807,16 @@ router.post("/:id/stop", async (req: Request, res: Response) => {
       redis.publish(CHANNEL, JSON.stringify(stopPayload)),
     ]);
     clearUserState(userId);
+
+    // ── EMIT STOP EVENT DIRECTLY TO SOCKET.IO CLIENTS ───────────────────
+    // Dashboard dashboards listen for 'locationUpdate' with stopped: true flag
+    // Emit immediately so connected clients see the stop before the 5s poll
+    const io = getIo();
+    if (io) {
+      const stopEvent = { ...stopPayload, stopped: true };
+      io.emit("locationUpdate", stopEvent);
+      console.log(`[stop] emitted stop event to Socket.IO for ${userId}`);
+    }
 
     // ── 2. RESPOND TO THE CLIENT IMMEDIATELY ─────────────────────────────
     // The mobile UI no longer has to wait for the 9k-row INSERT loop. The
