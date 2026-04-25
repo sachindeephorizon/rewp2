@@ -18,7 +18,8 @@ type RedisClient = ReturnType<typeof createClient>;
 
 const MAX_SPEED_MS = 80;          // ~290 km/h
 const STATIONARY_THRESHOLD = 4;   // meters
-const MAX_JUMP_DIST = 300;        // meters — fixed, no accuracy multiplier
+const MAX_JUMP_DIST = 300;        // meters — floor for short ping gaps
+const MAX_JUMP_SPEED_MS = 30;     // ~108 km/h — scales jump tolerance with dt
 const MAX_DT = 60;                // seconds — covers Doze gaps
 // Strict accuracy gate. Cell-tower-only fixes (Accuracy.Lowest on the
 // client) report accuracy values of 500–3000 m and get rejected here —
@@ -232,12 +233,11 @@ export function processLocationDetailed(
     newLat, newLng
   );
 
-  // Strict jump bound. A real, accurate GPS fix shouldn't move more than
-  // 300 m in a single ping (~70 m/s × the typical 4-s gap = 280 m). Larger
-  // is treated as a spike and rejected. This is what keeps the trail clean
-  // when the user is stationary — without it, cell-tower noise would draw
-  // a scattered cloud of dots over a single point.
-  if (rawDist > MAX_JUMP_DIST) return { location: null, reason: 'jump_too_large' };
+  // Scale the jump bound with dt. A fixed 300 m cap works for short
+  // foreground cadences but falsely rejects legitimate T1 movement when
+  // the passive cadence stretches to 60 s.
+  const maxJumpDist = Math.max(MAX_JUMP_DIST, MAX_JUMP_SPEED_MS * dt);
+  if (rawDist > maxJumpDist) return { location: null, reason: 'jump_too_large' };
 
   const rawSpeed = rawDist / dt;
   if (rawSpeed > MAX_SPEED_MS) return { location: null, reason: 'raw_speed_too_high' };

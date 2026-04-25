@@ -386,7 +386,9 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
 
     // ── FILTERED PING ─────────────────────────────────────────────────────────
     if (!processed) {
-      state.filterStreak = (state.filterStreak || 0) + 1;
+      if (processedResult.reason !== 'non_positive_dt') {
+        state.filterStreak = (state.filterStreak || 0) + 1;
+      }
 
       if (state.filterStreak >= MAX_FILTER_STREAK) {
         console.warn(`[ping] Filter streak ${state.filterStreak} for ${userId} - force resetting state`);
