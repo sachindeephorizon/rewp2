@@ -211,6 +211,7 @@ router.post('/checkin/:user_id/respond', async (req: Request<{ user_id: string }
       tier: 3,
       tier_name: 'emergency',
       interval_minutes: TIER_CONFIG[3].interval_minutes,
+      next_checkin_at: session.next_checkin_at,
       trigger_escalation: true,
       alert: {
         type: 'NEED_HELP',
