@@ -172,6 +172,38 @@ async function connectDB(): Promise<void> {
 
       CREATE INDEX IF NOT EXISTS idx_risk_h3_cell ON h3_risk_scores(h3_cell);
       CREATE INDEX IF NOT EXISTS idx_risk_score ON h3_risk_scores(risk_score);
+
+      -- ═══════════════════════════════════════════════════════════════
+      -- SOC_EVENTS (outbox for the SOC dashboard)
+      -- ═══════════════════════════════════════════════════════════════
+      -- Durable record of every monitoring event that should reach SOC.
+      -- Rows are created synchronously with the triggering action (escalation,
+      -- tier shift, missed check-in), then delivered asynchronously via
+      -- Socket.IO (live) + optional HTTP webhook. If SOC is offline the rows
+      -- simply stay with delivered_at IS NULL; a retry worker scans them and
+      -- a fresh Socket.IO connection gets the backlog on join.
+      CREATE TABLE IF NOT EXISTS soc_events (
+        id               UUID PRIMARY KEY,
+        user_id          VARCHAR(100) NOT NULL,
+        session_id       VARCHAR(100),
+        event_type       TEXT NOT NULL,
+        severity         TEXT NOT NULL DEFAULT 'info',
+        payload          JSONB NOT NULL,
+        idempotency_key  TEXT UNIQUE,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        delivered_at     TIMESTAMPTZ,
+        delivered_via    TEXT,
+        acked_by         TEXT,
+        attempts         INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at  TIMESTAMPTZ,
+        last_error       TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_soc_events_pending
+        ON soc_events(delivered_at, created_at)
+        WHERE delivered_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_soc_events_user ON soc_events(user_id);
+      CREATE INDEX IF NOT EXISTS idx_soc_events_created ON soc_events(created_at DESC);
     `);
 
     client.release();

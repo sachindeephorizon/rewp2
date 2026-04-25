@@ -1,5 +1,6 @@
 import express, { Router, Request, Response } from 'express';
 import { sessionStore } from './entry';
+import { dispatchToSoc } from '../services/soc.dispatch.service';
 
 const router: Router = express.Router();
 
@@ -71,6 +72,24 @@ export async function shiftTier(session: CheckinSession, newTier: Tier, reason: 
     });
   } catch (err) {
     console.error('Could not notify location service about tier change:', err);
+  }
+
+  // SOC notification — only on emergency escalation. Tier 1 ↔ Tier 2 churn
+  // is internal cadence management; SOC only cares when the user enters T3.
+  if (newTier === 3) {
+    dispatchToSoc({
+      userId: session.user_id,
+      sessionId: entrySession?.session_id ?? null,
+      type: 'tier_escalated',
+      severity: 'critical',
+      payload: {
+        tier: 3,
+        tier_name: TIER_CONFIG[3].name,
+        reason,
+        previous_tier: session.tier_history[session.tier_history.length - 2]?.tier ?? null,
+      },
+      idempotencyKey: `tier_escalated:${session.user_id}:${session.tier_history[session.tier_history.length - 1]?.at ?? Date.now()}`,
+    }).catch((err) => console.error('[SOC] dispatch failed:', (err as Error).message));
   }
 }
 
@@ -172,6 +191,19 @@ router.post('/checkin/:user_id/respond', async (req: Request<{ user_id: string }
       });
       entrySession.safety_signals.soc = 'alerted';
     }
+
+    dispatchToSoc({
+      userId: user_id,
+      sessionId: entrySession?.session_id ?? null,
+      type: 'user_needs_help',
+      severity: 'critical',
+      payload: {
+        tier: 3,
+        tier_name: 'emergency',
+        triggered_at: new Date().toISOString(),
+      },
+      idempotencyKey: `user_needs_help:${user_id}:${session.last_checkin_at ?? Date.now()}`,
+    }).catch((err) => console.error('[SOC] dispatch failed:', (err as Error).message));
 
     res.json({
       user_id,
@@ -281,6 +313,20 @@ router.post('/checkin/:user_id/missed', async (req: Request<{ user_id: string }>
   if (session.tier < 3) {
     await shiftTier(session, 3, 'missed_checkin');
   }
+
+  dispatchToSoc({
+    userId: user_id,
+    sessionId: entrySession?.session_id ?? null,
+    type: 'checkin_missed',
+    severity: 'critical',
+    payload: {
+      missed_count: session.missed_count,
+      tier: session.tier,
+      tier_name: TIER_CONFIG[session.tier].name,
+      next_checkin_at: session.next_checkin_at,
+    },
+    idempotencyKey: `checkin_missed:${user_id}:${session.missed_count}:${session.last_checkin_at ?? 'none'}`,
+  }).catch((err) => console.error('[SOC] dispatch failed:', (err as Error).message));
 
   res.json({
     user_id,

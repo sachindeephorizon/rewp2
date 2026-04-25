@@ -9,6 +9,7 @@ import { connectDB } from "./db";
 import { initSocket } from "./socket";
 import { initGpsState } from "./utils/gps";
 import routes from "./routes";
+import { startSocRetryWorker } from "./services/soc.dispatch.service";
 
 const app = express();
 const PORT = process.env.PORT || 9001;
@@ -44,6 +45,7 @@ async function start(): Promise<void> {
 
   const server = http.createServer(app);
   initSocket(server);
+  startSocRetryWorker();
 
   server.listen(PORT, () => {
     console.log("═══════════════════════════════════════════════════");

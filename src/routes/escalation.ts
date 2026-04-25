@@ -1,6 +1,7 @@
 import express, { Router, Request, Response } from 'express';
 import { sessionStore } from './entry';
 import { checkinStore, TIER_CONFIG } from './checkin';
+import { dispatchToSoc } from '../services/soc.dispatch.service';
 
 const router: Router = express.Router();
 
@@ -96,6 +97,22 @@ router.post('/escalation/:user_id/trigger', (req: Request<{ user_id: string }>, 
     session.safety_signals.soc = 'alerted';
   }
 
+  // Notify SOC — durable + real-time. If the SOC dashboard is down, the
+  // outbox row persists and the next connecting dashboard socket drains it.
+  dispatchToSoc({
+    userId: user_id,
+    sessionId: session?.session_id ?? null,
+    type: 'escalation_triggered',
+    severity: 'critical',
+    payload: {
+      escalation_id,
+      reason,
+      current_step: 1,
+      current_step_name: 'Push notification sent',
+    },
+    idempotencyKey: `escalation_triggered:${escalation_id}`,
+  }).catch((err) => console.error('[SOC] dispatch failed:', (err as Error).message));
+
   res.json({
     user_id,
     escalation_id,
@@ -139,6 +156,20 @@ router.put('/escalation/:user_id/advance', (req: Request<{ user_id: string }>, r
       type: 'danger'
     });
   }
+
+  dispatchToSoc({
+    userId: user_id,
+    sessionId: sessionStore[user_id]?.session_id ?? null,
+    type: 'escalation_advanced',
+    severity: 'critical',
+    payload: {
+      escalation_id: esc.escalation_id,
+      current_step: esc.current_step,
+      current_step_name: esc.steps[esc.current_step - 1].name,
+      reason: esc.reason,
+    },
+    idempotencyKey: `escalation_advanced:${esc.escalation_id}:${esc.current_step}`,
+  }).catch((err) => console.error('[SOC] dispatch failed:', (err as Error).message));
 
   // If step 5 — notify trusted contacts from session
   if (esc.current_step === 5) {
@@ -212,6 +243,21 @@ router.put('/escalation/:user_id/safe', async (req: Request<{ user_id: string }>
     });
     session.safety_signals.soc = 'watching';
   }
+
+  dispatchToSoc({
+    userId: user_id,
+    sessionId: sessionStore[user_id]?.session_id ?? null,
+    type: 'escalation_resolved',
+    severity: 'info',
+    payload: {
+      escalation_id: esc.escalation_id,
+      resolved_by: 'user',
+      stopped_at_step: esc.current_step,
+      stopped_at_step_name: esc.steps[esc.current_step - 1].name,
+      tier_reset_to: 1,
+    },
+    idempotencyKey: `escalation_resolved:${esc.escalation_id}`,
+  }).catch((err) => console.error('[SOC] dispatch failed:', (err as Error).message));
 
   res.json({
     user_id,

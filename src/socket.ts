@@ -7,9 +7,22 @@ import {
   SOCKET_GLOBAL_EVENT,
   SOCKET_STREAM_EVENT,
   SOCKET_STOP_EVENT,
+  SOC_ROOM,
+  SOC_ACK_EVENT,
 } from "./config";
 import { buildStreamMetadata, normalizeToken } from "./utils/stream";
 import type { Server as HttpServer } from "http";
+import {
+  flushPendingSocEventsTo,
+  markSocEventAcked,
+} from "./services/soc.dispatch.service";
+
+// Module-level singleton so non-socket modules (e.g. the SOC dispatcher)
+// can emit without plumbing `io` through function args.
+let ioInstance: Server | null = null;
+export function getIo(): Server | null {
+  return ioInstance;
+}
 
 interface LocationData {
   userId?: string;
@@ -34,10 +47,39 @@ export function initSocket(httpServer: HttpServer): Server {
   });
 
   io.adapter(createAdapter(ioPub, ioSub));
+  ioInstance = io;
   console.log("[Socket.io] Redis adapter attached (horizontal scaling ready)");
 
   io.on("connection", (socket) => {
     console.log(`[Socket.io] Client connected | id=${socket.id}`);
+
+    // SOC dashboard join — on connect, flush every undelivered event as a
+    // backlog batch. This is how "SOC was down, now back up" recovers:
+    // events piled up in soc_events; the first fresh socket to join drains.
+    socket.on("subscribe:soc", async (payload: { agentId?: string } = {}) => {
+      const agentId = normalizeToken(payload.agentId ?? null, null);
+      socket.join(SOC_ROOM);
+      socket.emit("soc:subscribed", { room: SOC_ROOM, agentId });
+      try {
+        await flushPendingSocEventsTo(socket, agentId);
+      } catch (err) {
+        console.error("[SOC] backlog flush failed:", (err as Error).message);
+      }
+    });
+
+    socket.on("unsubscribe:soc", () => {
+      socket.leave(SOC_ROOM);
+    });
+
+    // Dashboard acks an event — stop retrying it.
+    socket.on(SOC_ACK_EVENT, async (payload: { id?: string; agentId?: string } = {}) => {
+      if (!payload?.id) return;
+      try {
+        await markSocEventAcked(payload.id, payload.agentId ?? null, "socket");
+      } catch (err) {
+        console.error("[SOC] ack failed:", (err as Error).message);
+      }
+    });
 
     const joinRoom = (room: string | null): void => {
       if (!room) return;

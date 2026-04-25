@@ -8,6 +8,7 @@ import destinationRoutes from "./destination";
 import entryRoutes from "./entry";
 import checkinRoutes from "./checkin";
 import escalationRoutes from "./escalation";
+import socRoutes from "./soc";
 
 const router = Router();
 
@@ -35,5 +36,9 @@ router.use("/destination", destinationRoutes);
 router.use("/handling", entryRoutes);
 router.use("/handling", checkinRoutes);
 router.use("/handling", escalationRoutes);
+
+// SOC dashboard surface — history / pending / ack
+// GET /soc/events, GET /soc/events/pending, POST /soc/events/:id/ack
+router.use("/soc", socRoutes);
 
 export default router;
