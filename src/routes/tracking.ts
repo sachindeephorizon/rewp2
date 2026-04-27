@@ -761,6 +761,13 @@ router.post("/:id/ping", async (req: Request, res: Response) => {
       redis.publish(CHANNEL, JSON.stringify(enrichedPayload)).catch(() => {});
     }
 
+    // Heartbeat: every successful ping refreshes a per-user timestamp the
+    // gap watcher checks. When the OS suspends the foreground service
+    // (Android Doze, ColorOS battery kill, network blackout), no ping
+    // arrives → this key ages → the watcher emits a `ping:gap` warning so
+    // SOC sees "gone dark" instead of a deceptive "all clear".
+    redis.set(`lastPingAt:${userId}`, String(Date.now()), { EX: 24 * 3600 }).catch(() => {});
+
     res.status(200).json({
       ok: true,
       data: payload,
@@ -882,6 +889,7 @@ router.post("/:id/stop", async (req: Request, res: Response) => {
       redis.del(`devstreak:${userId}`),
       redis.del(`inactwin:${userId}`),
       redis.del(`gpsstate:${userId}`),
+      redis.del(`lastPingAt:${userId}`),
       redis.sRem(ACTIVE_SET, userId),
       // ── ISSUE 7 FIX: Stamp a "stopped" gate so any ping that arrives
       // in the next 5 min (background task still draining, batched fixes

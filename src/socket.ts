@@ -204,19 +204,25 @@ export function initSocket(httpServer: HttpServer): Server {
     try {
       const data: LocationData = JSON.parse(message);
 
-      if (data.event === "deviation_alert" || data.event === "inactivity_alert" || data.event === "arrival_detected") {
+      if (data.event === "deviation_alert" || data.event === "inactivity_alert" || data.event === "arrival_detected" || data.event === "ping_gap") {
         const eventMap: Record<string, string> = {
           deviation_alert: "deviation:alert",
           inactivity_alert: "inactivity:alert",
           arrival_detected: "arrival:detected",
+          ping_gap: "ping:gap",
         };
         const socketEvent = eventMap[data.event];
-        if (data.roomNames) {
+        // Emit per-room when we have rooms; otherwise fall back to global.
+        // Previously we emitted to BOTH which caused dashboards subscribed to
+        // a user room to receive the same alert twice (or 3-4× when streamMeta
+        // produced multiple rooms). One delivery per subscriber is plenty.
+        if (data.roomNames && data.roomNames.length > 0) {
           data.roomNames.forEach((room) => {
             io.to(room).emit(socketEvent, data);
           });
+        } else {
+          io.emit(socketEvent, data);
         }
-        io.emit(socketEvent, data);
         return;
       }
 
