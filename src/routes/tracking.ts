@@ -146,12 +146,26 @@ async function checkDeviation(
 
   console.log(`[deviation] ${userId} OUTSIDE corridor | streak=${newCount}`);
 
-  // Fire only on threshold crossings (one event per severity escalation),
-  // not on every consecutive ping.
+  // Severity reflects the CURRENT streak, not just threshold crossings.
+  // Previously this was `newCount === LONG_DEV_STREAK`, which fires the
+  // "long" alert exactly once at streak 8 and never again — meaning a
+  // dashboard subscribed to deviation events sees "short" for streaks
+  // 3-7 and only catches "long" if it happens to be online at exactly
+  // streak 8. With `>= LONG_DEV_STREAK` the alert keeps firing as "long"
+  // through streak 9, 10, 11... so any dashboard refresh shows the real
+  // current severity instead of stale "short".
   let severity: 'short' | 'long' | null = null;
-  if (newCount === SHORT_DEV_STREAK) severity = 'short';
-  else if (newCount === LONG_DEV_STREAK) severity = 'long';
+  if (newCount >= LONG_DEV_STREAK) severity = 'long';
+  else if (newCount >= SHORT_DEV_STREAK) severity = 'short';
   if (!severity) return { alert: null, streak: newCount };
+
+  // Don't spam pool.query inserts on every outside ping — that would
+  // create thousands of `deviations` rows per long detour. Only the
+  // threshold-crossing pings (3 and 8 exactly) write to Postgres / call
+  // escalateOnDeviation. Subsequent pings only refresh the redis snapshot
+  // and re-publish the live event so dashboards stay in sync.
+  const isCrossing =
+    newCount === SHORT_DEV_STREAK || newCount === LONG_DEV_STREAK;
 
   const alert: DeviationAlert = {
     userId,
@@ -175,25 +189,29 @@ async function checkDeviation(
     streamKey: streamMeta.streamKey,
   }));
 
-  pool.query(
-    `INSERT INTO deviations (user_id, lat, lng, h3_cell, zone, consecutive, destination_name)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [userId, lat, lng, devCell, alert.zone, newCount, destData.name || null]
-  ).catch((e: Error) => console.error("[deviation] DB insert failed:", e.message));
+  if (isCrossing) {
+    pool.query(
+      `INSERT INTO deviations (user_id, lat, lng, h3_cell, zone, consecutive, destination_name)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [userId, lat, lng, devCell, alert.zone, newCount, destData.name || null]
+    ).catch((e: Error) => console.error("[deviation] DB insert failed:", e.message));
 
-  pool.query(
-    `INSERT INTO session_events (user_id, event_type, lat, lng, h3_cell, metadata)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [userId, 'deviation_detected', lat, lng, devCell, JSON.stringify({ severity, consecutive: newCount, destinationName: destData.name })]
-  ).catch(() => {});
+    pool.query(
+      `INSERT INTO session_events (user_id, event_type, lat, lng, h3_cell, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [userId, 'deviation_detected', lat, lng, devCell, JSON.stringify({ severity, consecutive: newCount, destinationName: destData.name })]
+    ).catch(() => {});
 
-  // Bump check-in tier in-process (no HTTP round trip).
-  escalateOnDeviation(userId, severity).catch((e: Error) =>
-    console.error('[deviation] escalateOnDeviation failed:', e.message)
-  );
+    // Bump check-in tier in-process (no HTTP round trip). Only on the
+    // threshold-crossing pings to avoid re-pushing the same signal every
+    // ping (the tier engine already has it at this point).
+    escalateOnDeviation(userId, severity).catch((e: Error) =>
+      console.error('[deviation] escalateOnDeviation failed:', e.message)
+    );
 
     console.log(`[deviation] 🚨 ${userId} ${severity.toUpperCase()} alert | streak=${newCount}`);
-    return { alert, streak: newCount };
+  }
+  return { alert, streak: newCount };
 }
 
 // ── Deviation classification thresholds ──────────────────────────────────────
@@ -325,7 +343,13 @@ async function checkArrival(
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
+// NOTE: rateLimitPing middleware was removed. Frontend already throttles
+// (per-tier stationary cooldown + watcher cadence). Backend should record
+// every ping the client decides to send rather than 429-ing legitimate
+// background-batch deliveries — the user wants raw recording, no double
+// filtering. Kalman smoothing still runs for snap-to-road visuals, but we
+// no longer REJECT pings based on its verdict (see below).
+router.post("/:id/ping", async (req: Request, res: Response) => {
   try {
     const userId = req.params.id as string;
     const body = req.body as PingBody;
@@ -382,65 +406,19 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
       userAccuracy,
       userTimestamp
     );
-    const processed = processedResult.location;
-
-    // ── FILTERED PING ─────────────────────────────────────────────────────────
-    if (!processed) {
-      if (processedResult.reason !== 'non_positive_dt') {
-        state.filterStreak = (state.filterStreak || 0) + 1;
-      }
-
-      if (state.filterStreak >= MAX_FILTER_STREAK) {
-        console.warn(`[ping] Filter streak ${state.filterStreak} for ${userId} - force resetting state`);
-        state.prev = null;
-        state.kalman.reset();
-        state.filterStreak = 0;
-        await saveUserState(userId);
-      }
-
-          let filteredDevAlert: DeviationAlert | null = null;
-      let filteredArrival = false;
-      let filteredDevStreak = 0;
-
-      const filteredDestRaw = await redis.get(`nav:dest:${userId}`);
-      if (filteredDestRaw) {
-        const fd = JSON.parse(filteredDestRaw) as DestinationData;
-
-        filteredArrival = await checkArrival(userId, lat, lng, fd, streamMeta, null);
-
-        if (!filteredArrival) {
-          const r = await checkDeviation(userId, lat, lng, streamMeta, fd);
-          filteredDevAlert = r.alert;
-          filteredDevStreak = r.streak;
-        }
-      }
-
-      const pendingReq = await redis.get(`locreq:${userId}`);
-      const tierSnap = getCheckinSnapshot(userId);
-
-            res.status(200).json({
-        ok: true,
-        filtered: true,
-        reason: processedResult.reason ?? "gps_filtered",
-        streak: state.filterStreak,
-        streamKey: streamMeta.streamKey,
-        rideChannel: streamMeta.rideChannel,
-        sessionId: streamMeta.sessionId,
-        forceRefresh: !!pendingReq,
-        deviationAlert: filteredDevAlert,
-        deviationFlag: filteredDevStreak > 0,
-        speedKmh: typeof body.speed === 'number' && Number.isFinite(body.speed) ? Math.round(body.speed * 3.6 * 10) / 10 : null,
-        arrivalDetected: filteredArrival,
-        tier: tierSnap?.tier ?? null,
-        tierName: tierSnap?.tier_name ?? null,
-        intervalMinutes: tierSnap?.interval_minutes ?? null,
-        nextCheckinAt: tierSnap?.next_checkin_at ?? null,
-        missedCheckin: tierSnap?.missed ?? false,
-      });
-      return;
-    }
-
-    // ── ACCEPTED PING ─────────────────────────────────────────────────────────
+    // No more "filtered" early-exit. The frontend already gates pings via
+    // the per-tier stationary cooldown and watcher cadence; the backend's
+    // job is to record what arrives, not second-guess it.
+    //
+    // Kalman still runs (its smoothed output is what we feed to snap-to-road
+    // for clean trail visuals), but if it rejects the fix as a spike we
+    // fall back to the raw client coords rather than dropping the ping.
+    const processed =
+      processedResult.location ?? {
+        latitude: lat,
+        longitude: lng,
+        timestamp: userTimestamp ?? Date.now(),
+      };
 
     state.filterStreak = 0;
 
@@ -532,9 +510,11 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
       redis.sAdd(ACTIVE_SET, userId),
     ];
 
-    if (isRealMovement || isFirstPing) {
-      redisOps.push(redis.publish(CHANNEL, JSON.stringify(payload)));
-    }
+    // NOTE: previously we published the bare-bones `payload` here. Moved to
+    // the end of the handler so the live dashboard payload includes
+    // tier/deviation/inactivity/missed-checkin state computed below.
+    // Without that move, dashboards saw raw lat/lng only, and "tier"
+    // never updated unless the dashboard separately polled /handling/checkin.
 
     if (isFirstPing) {
       try {
@@ -749,6 +729,36 @@ router.post("/:id/ping", rateLimitPing, async (req: Request, res: Response) => {
       locationPoint = JSON.stringify(parsedPoint);
     } catch {
       // best-effort only
+    }
+
+    // Enriched live payload — same shape as `payload` but augmented with
+    // every monitoring signal the dashboard cares about. Keeps /users/active
+    // and the live socket feed in lockstep with the response the mobile
+    // client received this same call.
+    const enrichedPayload: Record<string, unknown> = {
+      ...(payload as unknown as Record<string, unknown>),
+      h3Cell,
+      deviationFlag: devStreak > 0,
+      deviationSeverity: devStreak >= LONG_DEV_STREAK
+        ? 'long'
+        : devStreak >= SHORT_DEV_STREAK
+          ? 'short'
+          : null,
+      deviationStreak: devStreak,
+      inactivityFlag,
+      arrivalDetected,
+      tier: tierSnap?.tier ?? null,
+      tierName: tierSnap?.tier_name ?? null,
+      intervalMinutes: tierSnap?.interval_minutes ?? null,
+      nextCheckinAt: tierSnap?.next_checkin_at ?? null,
+      missedCheckin: tierSnap?.missed ?? false,
+    };
+
+    if (isRealMovement || isFirstPing) {
+      // Single publish with the full state. Dashboards subscribed to
+      // `locationUpdate` / `stream:update` get tier + deviation + missed
+      // checkin on every movement ping, no separate polling needed.
+      redis.publish(CHANNEL, JSON.stringify(enrichedPayload)).catch(() => {});
     }
 
     res.status(200).json({

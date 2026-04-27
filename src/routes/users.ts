@@ -21,6 +21,36 @@ async function loadFallbackActiveUserIds(limit: number): Promise<string[]> {
   return Array.from(ids);
 }
 
+/**
+ * Drop any userId that has a live `stopped:{id}` flag set.
+ *
+ * The /stop handler stamps `stopped:{id}` with a 5-min TTL. While it's set,
+ * the user must NOT appear in /active even if leftover redis keys (e.g.
+ * `session:{id}:start` still pending background DB persist) would
+ * otherwise resurrect them via the fallback scan. Without this guard the
+ * dashboard shows a "stale" user-shaped row for several seconds — or
+ * indefinitely if the DB persist fails.
+ *
+ * Side-effect: every stopped userId we find still in ACTIVE_SET gets
+ * sRem'd here, so the next call doesn't repeat the same work.
+ */
+async function filterOutStoppedUsers(userIds: string[]): Promise<string[]> {
+  if (userIds.length === 0) return userIds;
+  const stoppedFlags = await Promise.all(
+    userIds.map((id) => redis.get(`stopped:${id}`)),
+  );
+  const stoppedIds: string[] = [];
+  const live: string[] = [];
+  for (let i = 0; i < userIds.length; i++) {
+    if (stoppedFlags[i]) stoppedIds.push(userIds[i]);
+    else live.push(userIds[i]);
+  }
+  if (stoppedIds.length > 0) {
+    redis.sRem(ACTIVE_SET, stoppedIds).catch(() => {});
+  }
+  return live;
+}
+
 router.get("/active", async (req: Request, res: Response) => {
   try {
     const limit = Math.min(parseInt(req.query.limit as string, 10) || 50, 200);
@@ -35,10 +65,21 @@ router.get("/active", async (req: Request, res: Response) => {
     if (userIds.length === 0) {
       const fallbackUserIds = await loadFallbackActiveUserIds(limit);
       if (fallbackUserIds.length > 0) {
-        userIds = fallbackUserIds;
-        nextCursor = 0;
-        redis.sAdd(ACTIVE_SET, fallbackUserIds).catch(() => {});
+        // Filter BEFORE re-adding to ACTIVE_SET — otherwise stopped users
+        // come back to life every time someone polls /active.
+        const liveFallback = await filterOutStoppedUsers(fallbackUserIds);
+        if (liveFallback.length > 0) {
+          userIds = liveFallback;
+          nextCursor = 0;
+          redis.sAdd(ACTIVE_SET, liveFallback).catch(() => {});
+        }
       }
+    } else {
+      // Even on the primary path, drop any userId whose `stopped:` flag is
+      // set. The /stop handler clears ACTIVE_SET, but any in-flight ping
+      // that races the stop can briefly re-add the user before /ping's
+      // own stopped-flag guard kicks in.
+      userIds = await filterOutStoppedUsers(userIds);
     }
 
     if (userIds.length === 0) {
@@ -70,6 +111,12 @@ router.get("/active", async (req: Request, res: Response) => {
           sessionMeta: meta,
         });
       } else if (hasSession) {
+        // Session-start exists but no live `user:{id}` location key. After
+        // /stop, `user:{id}` is cleared in Phase 1 and `session:{id}:start`
+        // is cleared in Phase 3 (after DB persist). The window between
+        // can show a "stale" row here — but the `stopped:` filter above
+        // already removed those, so anything reaching this branch is a
+        // genuine pre-first-ping session.
         users.push({
           userId: userIds[i],
           lat: null,
