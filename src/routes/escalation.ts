@@ -2,6 +2,8 @@ import express, { Router, Request, Response } from 'express';
 import { sessionStore } from './entry';
 import { checkinStore, TIER_CONFIG } from './checkin';
 import { dispatchToSoc } from '../services/soc.dispatch.service';
+import { redis } from '../redis';
+import { pool } from '../db';
 
 const router: Router = express.Router();
 
@@ -225,6 +227,9 @@ router.put('/escalation/:user_id/safe', async (req: Request<{ user_id: string }>
     checkin.interval_minutes = TIER_CONFIG[1].interval_minutes;
     checkin.missed_count = 0;
     checkin.last_response = 'safe';
+    checkin.next_checkin_at = new Date(
+      Date.now() + TIER_CONFIG[1].interval_minutes * 60_000,
+    ).toISOString();
     checkin.tier_history.push({
       tier: 1,
       tier_name: 'passive',
@@ -232,6 +237,27 @@ router.put('/escalation/:user_id/safe', async (req: Request<{ user_id: string }>
       at: new Date().toISOString()
     });
   }
+
+  // FULL-RESET TO TIER 1: clear every Redis key the deviation/inactivity
+  // detectors read so the next ping starts from zero. Without this, the
+  // backend still has devstreak >= 3 (or 8) and the very next ping
+  // outside the corridor immediately re-escalates the user we just told
+  // is "safe". Same story for the 10-min inactivity window — leftover
+  // samples could push 'inactivity' back to T2 within seconds.
+  Promise.all([
+    redis.del(`devstreak:${user_id}`),    // consecutive-out-of-corridor counter
+    redis.del(`deviation:${user_id}`),    // active deviation alert snapshot
+    redis.del(`inactwin:${user_id}`),     // 10-min inactivity sample window
+  ]).catch((err) =>
+    console.error('[escalation/safe] redis reset failed:', (err as Error).message),
+  );
+
+  // Mark any open deviations DB rows as resolved so historical reports
+  // don't show the user as "still deviated".
+  pool.query(
+    `UPDATE deviations SET resolved_at = NOW() WHERE user_id = $1 AND resolved_at IS NULL`,
+    [user_id],
+  ).catch(() => {});
 
   // Update session timeline
   const session = sessionStore[user_id];
