@@ -205,9 +205,17 @@ async function checkDeviation(
     // Bump check-in tier in-process (no HTTP round trip). Only on the
     // threshold-crossing pings to avoid re-pushing the same signal every
     // ping (the tier engine already has it at this point).
-    escalateOnDeviation(userId, severity).catch((e: Error) =>
-      console.error('[deviation] escalateOnDeviation failed:', e.message)
-    );
+    //
+    // MUST be awaited — getCheckinSnapshot() runs later in the same /ping
+    // handler to build the enrichedPayload that dashboards consume. If we
+    // fire-and-forget, the snapshot reads the OLD tier (T1) and the
+    // dashboard never sees the shift to T2/T3 until the NEXT ping. That
+    // produced the "tier stays T1 even at streak=3" symptom.
+    try {
+      await escalateOnDeviation(userId, severity);
+    } catch (e) {
+      console.error('[deviation] escalateOnDeviation failed:', (e as Error).message);
+    }
 
     console.log(`[deviation] 🚨 ${userId} ${severity.toUpperCase()} alert | streak=${newCount}`);
   }
@@ -688,9 +696,14 @@ router.post("/:id/ping", async (req: Request, res: Response) => {
             }));
 
             // Bump check-in tier (T1 → T2). Idempotent if already at T2/T3.
-            escalateOnInactivity(userId).catch((e: Error) =>
-              console.error('[inactivity] escalateOnInactivity failed:', e.message)
-            );
+            // Awaited so the getCheckinSnapshot() call later in this same
+            // /ping handler reflects the new tier — same race fix as
+            // escalateOnDeviation above.
+            try {
+              await escalateOnInactivity(userId);
+            } catch (e) {
+              console.error('[inactivity] escalateOnInactivity failed:', (e as Error).message);
+            }
 
             // Reset the window so we don't keep re-firing every ping.
             await clearInactivityWindow(userId);
@@ -704,7 +717,11 @@ router.post("/:id/ping", async (req: Request, res: Response) => {
       const win = await getWindowDisplacement(userId);
       if (win.spanS >= INACTIVITY_WINDOW_S && win.maxDisplacementM < INACTIVITY_DISTANCE_M) {
         inactivityFlag = true;
-        escalateOnInactivity(userId).catch(() => {});
+        try {
+          await escalateOnInactivity(userId);
+        } catch {
+          // best-effort
+        }
         await clearInactivityWindow(userId);
       }
     }

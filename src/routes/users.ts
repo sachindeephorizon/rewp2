@@ -22,31 +22,52 @@ async function loadFallbackActiveUserIds(limit: number): Promise<string[]> {
 }
 
 /**
- * Drop any userId that has a live `stopped:{id}` flag set.
+ * Drop any userId that has a live `stopped:{id}` flag set OR whose last
+ * ping is older than STALE_PING_THRESHOLD_MS.
  *
  * The /stop handler stamps `stopped:{id}` with a 5-min TTL. While it's set,
  * the user must NOT appear in /active even if leftover redis keys (e.g.
  * `session:{id}:start` still pending background DB persist) would
- * otherwise resurrect them via the fallback scan. Without this guard the
- * dashboard shows a "stale" user-shaped row for several seconds — or
- * indefinitely if the DB persist fails.
+ * otherwise resurrect them via the fallback scan.
  *
- * Side-effect: every stopped userId we find still in ACTIVE_SET gets
+ * Stale-ping safety net: if the mobile's /stop request never landed
+ * (offline at end-of-trip), the `stopped:` flag is never set. To prevent
+ * those abandoned sessions from showing in /active forever, we also drop
+ * users whose `lastPingAt:{id}` is older than 5 minutes. Real ongoing
+ * sessions ping at most every 60 s (T1 cadence), so a 5-min gap is a
+ * strong signal the session is dead.
+ *
+ * Side-effect: every dropped userId we find still in ACTIVE_SET gets
  * sRem'd here, so the next call doesn't repeat the same work.
  */
+const STALE_PING_THRESHOLD_MS = 5 * 60_000;
+
 async function filterOutStoppedUsers(userIds: string[]): Promise<string[]> {
   if (userIds.length === 0) return userIds;
-  const stoppedFlags = await Promise.all(
-    userIds.map((id) => redis.get(`stopped:${id}`)),
+  const flags = await Promise.all(
+    userIds.flatMap((id) => [
+      redis.get(`stopped:${id}`),
+      redis.get(`lastPingAt:${id}`),
+    ]),
   );
-  const stoppedIds: string[] = [];
+  const now = Date.now();
+  const droppedIds: string[] = [];
   const live: string[] = [];
   for (let i = 0; i < userIds.length; i++) {
-    if (stoppedFlags[i]) stoppedIds.push(userIds[i]);
-    else live.push(userIds[i]);
+    const stoppedFlag = flags[i * 2];
+    const lastPingRaw = flags[i * 2 + 1];
+    const lastPingMs = lastPingRaw ? Number(lastPingRaw) : NaN;
+    const isStopped = !!stoppedFlag;
+    const isStale =
+      Number.isFinite(lastPingMs) && now - lastPingMs > STALE_PING_THRESHOLD_MS;
+    if (isStopped || isStale) {
+      droppedIds.push(userIds[i]);
+    } else {
+      live.push(userIds[i]);
+    }
   }
-  if (stoppedIds.length > 0) {
-    redis.sRem(ACTIVE_SET, stoppedIds).catch(() => {});
+  if (droppedIds.length > 0) {
+    redis.sRem(ACTIVE_SET, droppedIds).catch(() => {});
   }
   return live;
 }
