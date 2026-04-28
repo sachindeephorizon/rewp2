@@ -208,17 +208,21 @@ router.put('/escalation/:user_id/safe', async (req: Request<{ user_id: string }>
   const { user_id } = req.params;
 
   const esc = escalationStore[user_id];
-  if (!esc || !esc.active) {
-    return res.status(404).json({ error: 'No active escalation' });
-  }
 
-  // Resolve escalation
-  esc.active = false;
-  esc.resolved = true;
-  esc.resolved_by = 'user';
-  esc.resolved_at = new Date().toISOString();
-  esc.steps[esc.current_step - 1].status = 'done_responded';
-  esc.steps[esc.current_step - 1].responded_at = new Date().toISOString();
+  // Robustness: if the server restarted (escalationStore is in-memory and
+  // was wiped) or the escalation was already resolved, still execute the
+  // Redis/DB cleanup and return success. The client has already shown the
+  // user as "safe" — refusing with 404 means the Redis deviation keys
+  // (devstreak, deviation, inactwin) never get cleared, and the very next
+  // ping re-escalates the user who just confirmed they're safe.
+  if (esc && esc.active) {
+    esc.active = false;
+    esc.resolved = true;
+    esc.resolved_by = 'user';
+    esc.resolved_at = new Date().toISOString();
+    esc.steps[esc.current_step - 1].status = 'done_responded';
+    esc.steps[esc.current_step - 1].responded_at = new Date().toISOString();
+  }
 
   // De-escalate check-in tier back to 1
   const checkin = checkinStore[user_id];
@@ -270,29 +274,31 @@ router.put('/escalation/:user_id/safe', async (req: Request<{ user_id: string }>
     session.safety_signals.soc = 'watching';
   }
 
-  dispatchToSoc({
-    userId: user_id,
-    sessionId: sessionStore[user_id]?.session_id ?? null,
-    type: 'escalation_resolved',
-    severity: 'info',
-    payload: {
-      escalation_id: esc.escalation_id,
-      resolved_by: 'user',
-      stopped_at_step: esc.current_step,
-      stopped_at_step_name: esc.steps[esc.current_step - 1].name,
-      tier_reset_to: 1,
-    },
-    idempotencyKey: `escalation_resolved:${esc.escalation_id}`,
-  }).catch((err) => console.error('[SOC] dispatch failed:', (err as Error).message));
+  if (esc) {
+    dispatchToSoc({
+      userId: user_id,
+      sessionId: sessionStore[user_id]?.session_id ?? null,
+      type: 'escalation_resolved',
+      severity: 'info',
+      payload: {
+        escalation_id: esc.escalation_id,
+        resolved_by: 'user',
+        stopped_at_step: esc.current_step,
+        stopped_at_step_name: esc.steps[esc.current_step - 1].name,
+        tier_reset_to: 1,
+      },
+      idempotencyKey: `escalation_resolved:${esc.escalation_id}`,
+    }).catch((err) => console.error('[SOC] dispatch failed:', (err as Error).message));
+  }
 
   res.json({
     user_id,
-    escalation_id: esc.escalation_id,
+    escalation_id: esc?.escalation_id ?? null,
     resolved: true,
     resolved_by: 'user',
-    resolved_at: esc.resolved_at,
-    stopped_at_step: esc.current_step,
-    stopped_at_step_name: esc.steps[esc.current_step - 1].name,
+    resolved_at: esc?.resolved_at ?? new Date().toISOString(),
+    stopped_at_step: esc?.current_step ?? null,
+    stopped_at_step_name: esc ? esc.steps[esc.current_step - 1].name : null,
     tier_reset_to: 1,
     message: 'Alert stopped. User confirmed safe. Back to normal monitoring.',
     timestamp: new Date().toISOString()
