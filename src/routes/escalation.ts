@@ -222,7 +222,7 @@ router.put('/escalation/:user_id/safe', async (req: Request<{ user_id: string }>
   const checkin = checkinStore[user_id];
   if (checkin && checkin.active) {
     checkin.tier = 1;
-    checkin.interval_minutes = TIER_CONFIG[1].interval_seconds;
+    checkin.interval_minutes = TIER_CONFIG[1].interval_minutes;
     checkin.missed_count = 0;
     checkin.last_response = 'safe';
     checkin.tier_history.push({

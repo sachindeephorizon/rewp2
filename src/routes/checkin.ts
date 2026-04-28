@@ -6,23 +6,10 @@ const router: Router = express.Router();
 
 const LOCATION_SERVICE_URL = process.env.LOCATION_SERVICE_URL || 'http://localhost:3001';
 
-// Per-tier check-in cadence — values are in SECONDS so testers can validate
-// the full pipeline without waiting 15 real minutes per cycle. Production
-// will tune these by changing only these three numbers.
-//
-// MUST match the mobile client's TIER_INTERVAL_SEC in
-// src/features/monitoring/MonitoringSession.tsx — out of sync would mean
-// the local engine and the backend disagree on how long until the next
-// check-in fires.
-//
-// `interval_minutes` is kept in the API response shape for backwards
-// compat (the mobile state field is also still called `intervalMinutes`)
-// but now CARRIES SECONDS. Display formatters need to interpret it as
-// seconds when value < 60.
 export const TIER_CONFIG = {
-  1: { name: 'passive',   interval_seconds: 15, countdown_seconds: 30 },
-  2: { name: 'active',    interval_seconds: 10, countdown_seconds: 30 },
-  3: { name: 'emergency', interval_seconds: 5,  countdown_seconds: 30 },
+  1: { name: 'passive',   interval_minutes: 15, countdown_seconds: 30 },
+  2: { name: 'active',    interval_minutes: 10, countdown_seconds: 30 },
+  3: { name: 'emergency', interval_minutes: 5,  countdown_seconds: 30 },
 } as const;
 
 export type Tier = 1 | 2 | 3;
@@ -30,8 +17,6 @@ export type Tier = 1 | 2 | 3;
 interface CheckinSession {
   user_id: string;
   tier: Tier;
-  // Carries SECONDS now (was minutes). Field name preserved for response
-  // backwards-compat with existing dashboard code.
   interval_minutes: number;
   countdown_seconds: number;
   last_checkin_at: string | null;
@@ -46,15 +31,15 @@ interface CheckinSession {
 // In-memory store
 export const checkinStore: Record<string, CheckinSession> = {};
 
-// Helper: calculate next check-in time. Argument is in SECONDS.
-function calcNextCheckin(intervalSec: number): string {
-  return new Date(Date.now() + intervalSec * 1000).toISOString();
+// Helper: calculate next check-in time
+function calcNextCheckin(intervalMin: number): string {
+  return new Date(Date.now() + intervalMin * 60000).toISOString();
 }
 
 // Helper: shift tier and notify location service
 export async function shiftTier(session: CheckinSession, newTier: Tier, reason: string) {
   session.tier = newTier;
-  session.interval_minutes = TIER_CONFIG[newTier].interval_seconds;
+  session.interval_minutes = TIER_CONFIG[newTier].interval_minutes;
   session.next_checkin_at = calcNextCheckin(session.interval_minutes);
   session.tier_history.push({
     tier: newTier,
@@ -116,10 +101,10 @@ router.post('/checkin/:user_id/start', (req: Request<{ user_id: string }>, res: 
   checkinStore[user_id] = {
     user_id,
     tier: 1,
-    interval_minutes: TIER_CONFIG[1].interval_seconds,
+    interval_minutes: TIER_CONFIG[1].interval_minutes,
     countdown_seconds: TIER_CONFIG[1].countdown_seconds,
     last_checkin_at: null,
-    next_checkin_at: calcNextCheckin(TIER_CONFIG[1].interval_seconds),
+    next_checkin_at: calcNextCheckin(TIER_CONFIG[1].interval_minutes),
     last_response: 'pending',
     checkin_count: 0,
     missed_count: 0,
@@ -131,7 +116,7 @@ router.post('/checkin/:user_id/start', (req: Request<{ user_id: string }>, res: 
     user_id,
     tier: 1,
     tier_name: 'passive',
-    interval_minutes: TIER_CONFIG[1].interval_seconds,
+    interval_minutes: TIER_CONFIG[1].interval_minutes,
     countdown_seconds: TIER_CONFIG[1].countdown_seconds,
     next_checkin_at: checkinStore[user_id].next_checkin_at,
     message: 'Check-in cycle started at Tier 1 (passive)',
@@ -225,7 +210,7 @@ router.post('/checkin/:user_id/respond', async (req: Request<{ user_id: string }
       status: 'need_help',
       tier: 3,
       tier_name: 'emergency',
-      interval_minutes: TIER_CONFIG[3].interval_seconds,
+      interval_minutes: TIER_CONFIG[3].interval_minutes,
       next_checkin_at: session.next_checkin_at,
       trigger_escalation: true,
       alert: {
@@ -434,10 +419,10 @@ function ensureCheckinSession(userId: string): CheckinSession {
   const fresh: CheckinSession = {
     user_id: userId,
     tier: 1,
-    interval_minutes: TIER_CONFIG[1].interval_seconds,
+    interval_minutes: TIER_CONFIG[1].interval_minutes,
     countdown_seconds: TIER_CONFIG[1].countdown_seconds,
     last_checkin_at: null,
-    next_checkin_at: calcNextCheckin(TIER_CONFIG[1].interval_seconds),
+    next_checkin_at: calcNextCheckin(TIER_CONFIG[1].interval_minutes),
     last_response: 'pending',
     checkin_count: 0,
     missed_count: 0,
