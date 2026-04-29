@@ -224,13 +224,20 @@ router.put('/escalation/:user_id/safe', async (req: Request<{ user_id: string }>
     esc.steps[esc.current_step - 1].responded_at = new Date().toISOString();
   }
 
-  // De-escalate check-in tier back to 1
+  // De-escalate check-in tier back to 1 — full fresh-T1 reset, identical
+  // contract to /checkin/respond is_safe=true. Anchor last_checkin_at to
+  // NOW so any subsequent tier shift (deviation/inactivity flagged again
+  // shortly after) computes its deadline from this safe-ack point, not
+  // the long-stale pre-escalation anchor.
   const checkin = checkinStore[user_id];
   if (checkin && checkin.active) {
+    const nowIso = new Date().toISOString();
     checkin.tier = 1;
     checkin.interval_minutes = TIER_CONFIG[1].interval_minutes;
     checkin.missed_count = 0;
     checkin.last_response = 'safe';
+    checkin.last_checkin_at = nowIso;
+    checkin.checkin_count += 1;
     checkin.next_checkin_at = new Date(
       Date.now() + TIER_CONFIG[1].interval_minutes * 60_000,
     ).toISOString();
@@ -238,7 +245,7 @@ router.put('/escalation/:user_id/safe', async (req: Request<{ user_id: string }>
       tier: 1,
       tier_name: 'passive',
       reason: 'escalation_resolved_by_user',
-      at: new Date().toISOString()
+      at: nowIso,
     });
   }
 

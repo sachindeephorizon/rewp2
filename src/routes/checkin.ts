@@ -1,11 +1,18 @@
 import express, { Router, Request, Response } from 'express';
 import { sessionStore } from './entry';
 import { dispatchToSoc } from '../services/soc.dispatch.service';
+import { redis } from '../redis';
+import { pool } from '../db';
 
 const router: Router = express.Router();
 
 const LOCATION_SERVICE_URL = process.env.LOCATION_SERVICE_URL || 'http://localhost:3001';
 
+// Per product spec, mirrored on the mobile client:
+//   T1 passive   — 15 min interval
+//   T2 active    — 10 min interval
+//   T3 emergency —  5 min interval
+// Response window for "Are you safe?" prompt is 30 s on every tier.
 export const TIER_CONFIG = {
   1: { name: 'passive',   interval_minutes: 15, countdown_seconds: 30 },
   2: { name: 'active',    interval_minutes: 10, countdown_seconds: 30 },
@@ -31,16 +38,41 @@ interface CheckinSession {
 // In-memory store
 export const checkinStore: Record<string, CheckinSession> = {};
 
-// Helper: calculate next check-in time
+// Helper: calculate next check-in time anchored to "now".
+// Used when there's no last_checkin_at to anchor against (session start,
+// /escalation/safe full reset, /checkin/respond is_safe=true).
 function calcNextCheckin(intervalMin: number): string {
   return new Date(Date.now() + intervalMin * 60000).toISOString();
+}
+
+// Compute next deadline anchored to the LAST successful check-in, with a
+// floor of "now". Matches the mobile client's tier-shift semantics:
+//   T2 escalation when 8 min elapsed since lastCheckin → 10 - 8 = 2 min remaining
+//   T3 escalation when 12 min elapsed since lastCheckin → 5 min already past → instant
+// Without this, every tier shift used `now + interval`, silently re-paying
+// the elapsed time the user already burned at the previous tier.
+function calcShiftedDeadline(
+  lastCheckinAt: string | null,
+  intervalMin: number,
+): string {
+  const now = Date.now();
+  if (!lastCheckinAt) return new Date(now + intervalMin * 60000).toISOString();
+  const baseMs = new Date(lastCheckinAt).getTime();
+  if (!Number.isFinite(baseMs)) return new Date(now + intervalMin * 60000).toISOString();
+  const dueMs = Math.max(now, baseMs + intervalMin * 60000);
+  return new Date(dueMs).toISOString();
 }
 
 // Helper: shift tier and notify location service
 export async function shiftTier(session: CheckinSession, newTier: Tier, reason: string) {
   session.tier = newTier;
   session.interval_minutes = TIER_CONFIG[newTier].interval_minutes;
-  session.next_checkin_at = calcNextCheckin(session.interval_minutes);
+  // Anchor the new deadline to the last successful check-in, NOT to `now`.
+  // This honors the spec "T2 = 10 min - elapsed, instant if negative".
+  session.next_checkin_at = calcShiftedDeadline(
+    session.last_checkin_at,
+    session.interval_minutes,
+  );
   session.tier_history.push({
     tier: newTier,
     tier_name: TIER_CONFIG[newTier].name,
@@ -147,14 +179,41 @@ router.post('/checkin/:user_id/respond', async (req: Request<{ user_id: string }
   const entrySession = sessionStore[user_id];
 
   if (is_safe) {
-    // ✅ "Yes, I'm Safe" — de-escalate to Tier 1
+    // ✅ "Yes, I'm Safe" — full reset to Tier 1, identical contract to
+    // /escalation/safe so the user gets the same "fresh slate" no matter
+    // which screen they tap from. Per spec: every safe ack resets tier to
+    // 1, restarts the 15-min countdown, clears deviation/inactivity
+    // tracking, and zeroes missed_count.
     session.last_response = 'safe';
-
-    if (session.tier > 1) {
-      await shiftTier(session, 1, 'user_confirmed_safe');
-    }
-
+    session.missed_count = 0;
+    session.tier = 1;
+    session.interval_minutes = TIER_CONFIG[1].interval_minutes;
     session.next_checkin_at = calcNextCheckin(session.interval_minutes);
+    session.tier_history.push({
+      tier: 1,
+      tier_name: TIER_CONFIG[1].name,
+      reason: 'user_confirmed_safe',
+      at: new Date().toISOString(),
+    });
+
+    // Wipe the deviation / inactivity Redis state so the next ping starts
+    // from streak=0 and an empty inactivity window. Without this, a user
+    // who confirms safe via the prompt while still off-corridor gets
+    // re-flagged within seconds because devstreak was preserved.
+    Promise.all([
+      redis.del(`devstreak:${user_id}`),
+      redis.del(`deviation:${user_id}`),
+      redis.del(`inactwin:${user_id}`),
+    ]).catch((err) =>
+      console.error('[checkin/respond] redis reset failed:', (err as Error).message),
+    );
+
+    // Mark any open deviation rows as resolved — keeps historical reports
+    // honest about when the user was actually deviated.
+    pool.query(
+      `UPDATE deviations SET resolved_at = NOW() WHERE user_id = $1 AND resolved_at IS NULL`,
+      [user_id],
+    ).catch(() => {});
 
     if (entrySession) {
       entrySession.timeline.push({
